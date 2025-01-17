@@ -1,0 +1,12 @@
+syntax = "proto3";
+package auditchain;
+
+option go_package = "./";
+
+message BlockMsg {
+  uint64 blkNum = 1;
+  string prevHash = 2;
+  string curHash = 3;
+  string signature = 4;
+}
+

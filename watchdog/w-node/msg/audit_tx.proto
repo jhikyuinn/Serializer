@@ -1,0 +1,81 @@
+syntax = "proto3";
+package msp;
+
+option go_package = "./";
+
+message standbyBSP {
+    uint32 id = 1;
+}
+
+message auditMsg {
+  uint32 blkNum = 1;
+  string prevHash = 2;
+  string MerkleRootHash = 3;
+  string time = 4;
+  string timeConstant = 5;
+  string curHash = 6;
+  string leaderID = 7;
+  bytes signature = 8;
+  repeated string honestAuditors = 9;
+
+  enum Phases {
+    PREPARE = 0;
+    AGGREGATED_PREPARE = 1;
+    COMMIT = 2;
+    AGGREGATED_COMMIT = 3;
+  }
+
+  Phases phaseNum = 10;
+  repeated bytes txList = 11;
+}
+
+message wnode {
+  string nodeID = 1;
+  string addr = 2;
+  string port = 3;
+  bytes publickey = 4;
+}
+
+message shard {
+  string ID = 1;
+  string leaderID = 2;
+  repeated wnode member = 3;
+}
+
+message committeeMsg {
+  uint32 type = 1;
+  uint32 roundNum = 2;
+  repeated shard shards = 3;
+}
+
+message committee {
+    string nodeID = 1;
+    string addr = 2;
+    string port = 3;
+    bytes publickey = 4;
+}
+
+message roundMsg {
+  repeated committee members = 1;
+  uint32 roundNum = 2; 
+  string leaderID = 3;
+  uint32 baseTime = 4;
+  uint32 consTime = 5;
+  string MerkleRootHash = 6;
+  repeated bytes txList = 7;
+}
+
+message transactionMsg {
+  uint64 blkNum = 1;
+  string prevHash = 2;
+  string curHash = 3;
+  string signature = 4;
+}
+
+message gossipMsg {
+    uint32 type = 1;
+    repeated committee members = 2;
+    roundMsg rndMsg = 3;
+    auditMsg rndblk = 4;
+    string channel = 5;
+}

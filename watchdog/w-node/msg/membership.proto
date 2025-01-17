@@ -1,0 +1,18 @@
+syntax = "proto3";
+package auditchain;
+
+option go_package = "./";
+
+message node {
+    uint32 nodeID = 1;
+    string addr = 2;
+    string port = 3;
+    string publickey = 4;
+}
+
+message MemberMsg {
+    repeated node nodes = 1;
+    uint32 leaderID = 2; 
+    uint32 startBlk = 3;
+    uint32 endBlk = 4;
+}

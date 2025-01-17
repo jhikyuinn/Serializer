@@ -1,0 +1,27 @@
+syntax = "proto3";
+option go_package = "./";
+package msp;
+
+service MembershipService {
+  rpc GetMembership(MemberMsg) returns (MemberMsg) {}
+  rpc GetAddress(Address) returns (Address) {}
+}
+
+message node {
+    string nodeID = 1;
+    string addr = 2;
+    string port = 3;
+    bytes publickey = 4;
+    bool alive = 5; 
+}
+
+message MemberMsg {
+    repeated node nodes = 1;
+    string leaderID = 2; 
+    uint32 startBlk = 3;
+    uint32 endBlk = 4;
+}
+
+message Address {
+    repeated string addr = 1;
+}
