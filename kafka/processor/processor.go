@@ -124,59 +124,53 @@ func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
 	if len(kafkadata) == 1 {
 		hello, _ := json.Marshal(kafkadata)
 		ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), hello)
-	} else {
-
-		var Ordereddata []*common.Envelope
-		var Abortdata []*common.Envelope
-		var Mediumdata []*common.Envelope
-		var Lowdata []*common.Envelope
-
-		for i := range kafkadata {
-			payload, _ := protoutil.UnmarshalTransaction(kafkadata[i].Payload)
-			if strings.Contains(payload.String(), `Queryy`) {
-				Ordereddata = append(Ordereddata, kafkadata[i])
-			} else if strings.Contains(payload.String(), `"Urgency\":true`) {
-				// 급한 트랜잭션을 발행한 유저들은 우선순위를 두고.
-				Mediumdata = append(Mediumdata, kafkadata[i])
-			} else {
-				// 이외의 트랜잭션들은 마지막으로.
-				Lowdata = append(Lowdata, kafkadata[i])
-			}
-		}
-
-		// ( 긴급한 트랜잭션을 먼저 정렬하고 Low를 따로 정렬하면 Low단에서 문제 발생하지 않나? )
-		SerialMediumTx, AbortMediumTx := epsilonOrdering(true, Mediumdata)
-		SerialLowTx, AbortLowTx := epsilonOrdering(false, Lowdata)
-
-		// 정렬된 트랜잭션을 역으로 추가
-		SerialMediumTx = reverseArray(SerialMediumTx)
-		AbortMediumTx = reverseArray(AbortMediumTx)
-		Ordereddata = append(Ordereddata, SerialMediumTx...)
-		Abortdata = append(Abortdata, AbortMediumTx...)
-
-		SerialLowTx = reverseArray(SerialLowTx)
-		AbortLowTx = reverseArray(AbortLowTx)
-		Ordereddata = append(Ordereddata, SerialLowTx...)
-		Abortdata = append(Abortdata, AbortLowTx...)
-
-		marshalledOrdereddata, _ := json.Marshal(Ordereddata)
-		marshalledAbortdata, _ := json.Marshal(Abortdata)
-
-		ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), marshalledOrdereddata)
-		ctx.Emit(topicabort, strconv.Itoa(int(ctx.Offset())), marshalledAbortdata)
-
-		fmt.Println("[Total Time]", time.Now().UnixMilli()-startelsaped)
-
+		return
 	}
+
+	var Ordereddata, Abortdata, Mediumdata, Lowdata []*common.Envelope
+
+	for _, data := range kafkadata {
+		payload, _ := protoutil.UnmarshalTransaction(data.Payload)
+		payloadStr := payload.String()
+
+		if strings.Contains(payloadStr, `Query`) {
+			Ordereddata = append(Ordereddata, data)
+		} else if strings.Contains(payloadStr, `"Urgency\":true`) {
+			Mediumdata = append(Mediumdata, data)
+		} else {
+			Lowdata = append(Lowdata, data)
+		}
+	}
+
+	// ( 긴급한 트랜잭션을 먼저 정렬하고 Low를 따로 정렬하면 Low단에서 문제 발생하지 않나? )
+	if len(Mediumdata) > 0 {
+		SerialMediumTx, AbortMediumTx := epsilonOrdering(true, Mediumdata)
+		Ordereddata = append(Ordereddata, reverseArray(SerialMediumTx)...)
+		Abortdata = append(Abortdata, reverseArray(AbortMediumTx)...)
+	}
+
+	// 낮은 우선순위 트랜잭션 처리
+	if len(Lowdata) > 0 {
+		SerialLowTx, AbortLowTx := epsilonOrdering(false, Lowdata)
+		Ordereddata = append(Ordereddata, reverseArray(SerialLowTx)...)
+		Abortdata = append(Abortdata, reverseArray(AbortLowTx)...)
+	}
+
+	marshalledOrdereddata, _ := json.Marshal(Ordereddata)
+	marshalledAbortdata, _ := json.Marshal(Abortdata)
+
+	ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), marshalledOrdereddata)
+	ctx.Emit(topicabort, strconv.Itoa(int(ctx.Offset())), marshalledAbortdata)
+
+	fmt.Println("[Total Time]", time.Now().UnixMilli()-startelsaped)
+
 }
 
 func epsilonOrdering(urgency bool, msg []*common.Envelope) (tSerial []*common.Envelope, tAbort []*common.Envelope) {
 
-	fmt.Println(len(msg))
-
 	var NumactualorderTx = 0
-	var Numdataitem = 10
-	var index = 0
+	// 미리 만들어놓은 유저의 크기에 맞게.
+	var Numdataitem = 4
 
 	// 급한 트랜잭션은 epsilon urgent값을 이용, 급하지 않다면 epsilon low 값을 이용
 	if urgency {
@@ -185,68 +179,50 @@ func epsilonOrdering(urgency bool, msg []*common.Envelope) (tSerial []*common.En
 		NumactualorderTx = int(math.Ceil(epsilonLow * float64(len(msg))))
 	}
 
-	// 초기화
 	Conflictgraph := make([][]int, NumactualorderTx)
-	for i := 0; i < NumactualorderTx; i++ {
-		Conflictgraph[i] = make([]int, NumactualorderTx)
-	}
-
-	// data에 대해 크기는 동일함.
 	Readset := make([][]int, NumactualorderTx)
 	Writeset := make([][]int, NumactualorderTx)
-	for i := range Readset {
+	Userset := make([]string, NumactualorderTx)
+
+	for i := 0; i < NumactualorderTx; i++ {
+		Conflictgraph[i] = make([]int, NumactualorderTx)
 		Readset[i] = make([]int, Numdataitem)
 		Writeset[i] = make([]int, Numdataitem)
 	}
 
-	// 트렌잭션 내용을 파악해서 그래프 만들기
+	re := regexp.MustCompile(`User(\d+)`)
+
 	for i := 0; i < NumactualorderTx; i++ {
 		payload, _ := protoutil.UnmarshalTransaction(msg[i].Payload)
-		re := regexp.MustCompile(`User(\d+)`)
-		seen := make(map[string]bool)
-
-		// payload에서 모든 User 뒤 숫자 추출
 		matches := re.FindAllStringSubmatch(payload.String(), -1)
 
+		seen := make(map[string]bool, len(matches))
 		for _, match := range matches {
 			if len(match) > 1 {
-				idx := match[1]
-
-				// 이미 처리한 숫자인지 확인
-				if _, exists := seen[idx]; !exists {
-					fmt.Println("Match:", idx) // 숫자 출력
-					index = idxToInt(idx)      // 필요한 처리 수행
-
-					// 숫자를 처리한 후, seen 맵에 추가
-					seen[idx] = true
-					fmt.Println("🚨", len(seen))
-				}
+				seen[match[1]] = true
 			}
 		}
 
-		if len(seen) == 1 {
-			fmt.Print(seen)
-			userString := fmt.Sprintf("User%d", index)
-			if strings.Contains(payload.String(), userString) {
-				Readset[i][index-1] = 1
-				Writeset[i][index-1] = 1
-			}
-		} else if len(seen) > 1 {
-			fmt.Print(seen)
-			userString := fmt.Sprintf("User%d", index)
-			fmt.Println("🚨", userString, "🚨")
-			if strings.Contains(payload.String(), userString) {
-				Readset[i][index-1] = 1
-				Writeset[i][index-1] = 1
-			}
+		// seen 맵에서 첫 번째 값을 얻음
+		var firstKey int
+		for key := range seen {
+			firstKey = idxToInt(key)
+			break
+		}
+		Userset[i] = fmt.Sprintf("User%d", firstKey)
+
+		// Readset과 Writeset을 설정
+		for key := range seen {
+			index := idxToInt(key) - 1
+			Readset[i][index] = 1
+			Writeset[i][index] = 1
 		}
 	}
 
-	//  write은 read에 영향을 미치니까 해당 부분은 1로 변경.
-	for i := 0; i < len(Readset); i++ {
-		for j := 0; j < len(Readset[i]); j++ {
+	for i := 0; i < NumactualorderTx; i++ {
+		for j := 0; j < Numdataitem; j++ {
 			if Readset[i][j] == 1 {
-				for k := 0; k < len(Readset); k++ {
+				for k := 0; k < NumactualorderTx; k++ {
 					if Writeset[k][j] == 1 && k != i {
 						Conflictgraph[k][i] = 1
 					}
@@ -255,7 +231,7 @@ func epsilonOrdering(urgency bool, msg []*common.Envelope) (tSerial []*common.En
 		}
 	}
 
-	order, aborted := transactionScheduler(Conflictgraph)
+	order, aborted := transactionScheduler(Userset, Conflictgraph)
 
 	for _, index := range order {
 		tSerial = append(tSerial, msg[index-1])
@@ -269,46 +245,57 @@ func epsilonOrdering(urgency bool, msg []*common.Envelope) (tSerial []*common.En
 }
 
 func idxToInt(s string) int {
-	var num int
-	fmt.Sscanf(s, "%d", &num)
+	num, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
 	return num
 }
 
 func reverseArray(arr []*common.Envelope) []*common.Envelope {
-	reversed := make([]*common.Envelope, len(arr)) // 원래 배열과 같은 크기의 배열 생성
-	for i, v := range arr {
-		reversed[len(arr)-1-i] = v // 뒤에서부터 값 추가
+	reversed := make([]*common.Envelope, len(arr))
+	copy(reversed, arr)
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
 	}
 	return reversed
 }
 
 func (g *Graph) AddEdge(from, to int) {
+	if len(g.edges[from]) == 0 {
+		g.edges[from] = make([]int, 0, 10)
+	}
 	g.edges[from] = append(g.edges[from], to)
 }
 
 func (g *Graph) RemoveNode(node int) {
 	delete(g.edges, node)
-	for from := range g.edges {
-		newEdges := []int{}
-		for _, to := range g.edges[from] {
+	for from, edges := range g.edges {
+		// 새로운 슬라이스로 필터링된 값을 저장
+		filteredEdges := edges[:0]
+		for _, to := range edges {
 			if to != node {
-				newEdges = append(newEdges, to)
+				filteredEdges = append(filteredEdges, to)
 			}
 		}
-		g.edges[from] = newEdges
+		g.edges[from] = filteredEdges
 	}
 }
 
 func hasCycleUtil(graph *Graph, node int, visited, recStack map[int]bool) bool {
+	if recStack[node] {
+		// 이미 순환을 찾았으면 바로 종료
+		return true
+	}
+	if visited[node] {
+		return false
+	}
+
 	visited[node] = true
 	recStack[node] = true
 
 	for _, neighbor := range graph.edges[node] {
-		if !visited[neighbor] {
-			if hasCycleUtil(graph, neighbor, visited, recStack) {
-				return true
-			}
-		} else if recStack[neighbor] {
+		if hasCycleUtil(graph, neighbor, visited, recStack) {
 			return true
 		}
 	}
@@ -317,53 +304,51 @@ func hasCycleUtil(graph *Graph, node int, visited, recStack map[int]bool) bool {
 	return false
 }
 
-func detectCycle(graph *Graph, size int) bool {
-	visited := make(map[int]bool)
-	recStack := make(map[int]bool)
+func detectCycle(graph *Graph) bool {
+	visited := make(map[int]bool, len(graph.edges))
+	recStack := make(map[int]bool, len(graph.edges))
 
-	for node := 1; node <= size; node++ {
-		if !visited[node] {
-			if hasCycleUtil(graph, node, visited, recStack) {
-				return true
-			}
+	for node := range graph.edges {
+		if !visited[node] && hasCycleUtil(graph, node, visited, recStack) {
+			return true
 		}
 	}
 	return false
 }
 
-func sortNodesByAbortInfo(graph *Graph, size int, abortInfo interface{}) []int {
+// 사용자의 트랜잭션 실패율을 최소화하도록 순서를 정렬
+func sortNodesByAbortInfo(size int, abortInfo interface{}) []int {
 	nodes := make([]int, 0, size)
 	for node := 1; node <= size; node++ {
 		nodes = append(nodes, node)
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
-		userI := graph.users[nodes[i]]
-		userJ := graph.users[nodes[j]]
 
-		valueI := getAbortCount(abortInfo, userI)
-		valueJ := getAbortCount(abortInfo, userJ)
+		valueI := getAbortCount(abortInfo, fmt.Sprintf("User%d", nodes[i]))
+		valueJ := getAbortCount(abortInfo, fmt.Sprintf("User%d", nodes[j]))
 
-		return valueI > valueJ
+		return valueI < valueJ
 	})
-
 	return nodes
 }
 
-func getAbortCount(abortInfo interface{}, user string) int {
-	abortInfoMap, ok := abortInfo.(map[string]interface{})
+// watchdog으로 부터 데이터를 받아서 정리
+func getAbortCount(abortInfo interface{}, user string) int32 {
+	abortInfoMap, ok := abortInfo.(bson.M)
 	if !ok {
 		return 0
 	}
 	if val, exists := abortInfoMap[user]; exists {
-		if intValue, ok := val.(int); ok {
+		if intValue, ok := val.(int32); ok {
 			return intValue
 		}
 	}
 	return 0
 }
 
-func transactionScheduler(matrix [][]int) ([]int, []int) {
+func transactionScheduler(userinfo []string, matrix [][]int) ([]int, []int) {
+
 	size := len(matrix)
 	graph := NewGraph(size)
 
@@ -376,28 +361,49 @@ func transactionScheduler(matrix [][]int) ([]int, []int) {
 	}
 
 	abortList := []int{}
-
+	abortListMap := make(map[int]bool)
 	abortInfo := UserabortInfoinWnode()
-	fmt.Println("⭐️", abortInfo, "⭐️")
 
-	for detectCycle(graph, size) {
-		sortedNodes := sortNodesByAbortInfo(graph, size, abortInfo)
+	userToTransactions := make(map[int][]int)
 
-		for _, node := range sortedNodes {
-			if !contains(abortList, node) {
-				abortList = append(abortList, node)
-				graph.RemoveNode(node)
+	for i, user := range userinfo {
+		userID := user[len(user)-1] - '0'
+		userToTransactions[int(userID)] = append(userToTransactions[int(userID)], i+1)
+	}
+
+	sortedNodes := sortNodesByAbortInfo(size, abortInfo)
+	for _, user := range sortedNodes {
+		transactions, exists := userToTransactions[user]
+		if !exists {
+			continue
+		}
+
+		for _, tx := range transactions {
+			if abortListMap[tx] {
+				continue
+			}
+
+			if detectCycle(graph) {
+				abortListMap[tx] = true
+				graph.RemoveNode(tx)
+				abortList = append(abortList, tx)
+				fmt.Printf("Removed transaction %d (User: User%d)\n", tx, user)
 				break
+			} else {
+				fmt.Printf("Transaction %d (User: User%d) does not cause a cycle. Skipping.\n", tx, user)
 			}
 		}
 	}
 
 	successList := []int{}
 	for i := 1; i <= size; i++ {
-		if !contains(abortList, i) {
+		if !abortListMap[i] {
 			successList = append(successList, i)
 		}
 	}
+
+	fmt.Println("SUC", successList)
+	fmt.Println("ABO", abortList)
 
 	return successList, abortList
 }
@@ -429,9 +435,13 @@ func UserabortInfoinWnode() interface{} {
 		} else {
 			log.Fatalf("Failed to fetch latest document: %v", err)
 		}
-		return result["NumofAbortTransaction"]
+		return nil
 	}
-	return result["NumofAbortTransaction"]
+	if abortCount, exists := result["NumofAbortTransaction"]; exists {
+		return abortCount
+	}
+
+	return nil
 }
 
 func contains(list []int, value int) bool {

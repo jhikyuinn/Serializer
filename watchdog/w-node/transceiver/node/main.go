@@ -174,7 +174,7 @@ func monitoring() {
 func main() {
 	snode := flag.String("snode", "117.16.244.33", "")
 	kafka := flag.String("broker", "117.16.244.33", "")
-	libp2pAddr := flag.String("libp2p", "/ip4/117.16.244.33/tcp/4041/p2p/QmWRVJEifrHHyc1DEDTNfuAeDGtvkT6cSdPAMUGc12KxX7", "")
+	libp2pAddr := flag.String("libp2p", "/ip4/117.16.244.33/tcp/4041/p2p/QmXCKbGHnpCjvArGzuejqwpYCt9p8qSmQfmBVp2LvrP1Sx", "")
 	ami := flag.Bool("ami", false, "")
 	chann := flag.String("channel", "mychannel", "")
 
