@@ -22,14 +22,17 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"regexp"
 	"runtime/metrics"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/BurntSushi/toml"
+	PuCtrl "github.com/MCNL-HGU/mp2btp/puctrl"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/golang/protobuf/proto"
+	"github.com/google/uuid"
 	"github.com/herumi/bls-eth-go-binary/bls"
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/protoutil"
@@ -39,24 +42,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-type HLFEncodedBlock struct {
-	BlockHeader   BlockHeader
-	BlockData     BlockData
-	BlockMetadata BlockMetadata
-	Padding       []int
-}
-type BlockHeader struct {
-	Number       uint64
-	PreviousHash []byte
-	DataHash     []byte
-}
-type BlockData struct {
-	Data [][]byte
-}
-type BlockMetadata struct {
-	Metadata [][]byte
-}
-
 type Fabric struct {
 	Num          uint64
 	PreviousHash []byte
@@ -64,14 +49,14 @@ type Fabric struct {
 	Consensus    bool
 }
 
-type WNODE struct {
+type CONSENSUSNODE struct {
 	wlog *log.Logger
 
 	address   string
 	selfId    string
 	roundIdx  uint32
 	members   []*pb.Wnode
-	isLeader  chan bool
+	isLeader  atomic.Bool
 	leader    bool
 	channelID string
 	done      chan bool
@@ -81,69 +66,77 @@ type WNODE struct {
 	auditMsg  *pb.AuditMsg
 }
 
-var (
-	sAddr    = "localhost:16220" // [S-Node] IP:Port for gRPC
-	sAddrNAT = "localhost:11730" // [S-Node] IP:Port for AWS NAT
-
-	LPORT = ":5252" // [W-Node] Port Number for consensus listening
-	GPORT = ":4242" // [W-Node] Gossip Msg Listening Port Number
-	HPORT = ":4243"
-	MPORT = ":12345" // [Prometheus]
-
-	addrL = "117.16.244.33" // [Default Leader Node] SAMSUNG IP
-
-	brokers = ""
-
-	leaderBro  = false
-	leaderChan = ""
+const (
+	validatorIP          = "117.16.244.33"
+	validatorGrpcPort    = "16220"
+	validatorNatPort     = "11730"
+	gossipMsgPort        = ":4242"
+	consensusPort        = ":5252"
+	gossipListenPort     = ":6262"
+	prometheusListenPort = ":12345"
 )
 
-func Kafka() *kafka.Consumer {
+var (
+	validatorGrpcAddr = validatorIP + ":" + validatorGrpcPort
+	validatorNatAddr  = validatorIP + ":" + validatorNatPort
+
+	brokers    = ""
+	leaderBro  = false
+	leaderChan = ""
+
+	sec    bls.SecretKey
+	pub    *bls.PublicKey
+	sigVec []bls.Sign
+	pubVec []bls.PublicKey
+)
+
+var MP2BTPsession *PuCtrl.PuCtrl
+
+func getKafkaGroupID() string {
+	hostname, _ := os.Hostname()
+	groupID := "myGroup-" + hostname
+	if groupID == "" {
+		// 환경변수가 없으면 임시 로컬용 UUID 생성
+		groupID = "local-" + uuid.New().String()
+		fmt.Println("KAFKA_GROUP_ID not set, using local generated ID:", groupID)
+	}
+	return groupID
+}
+
+func NewKafkaConsumer() *kafka.Consumer {
+	kafkaGroupID := getKafkaGroupID()
+	fmt.Println(kafkaGroupID)
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
 		"bootstrap.servers": brokers,
-		"group.id":          "myGroup",
+		"group.id":          kafkaGroupID,
 		"auto.offset.reset": "earliest",
 	})
-
 	if err != nil {
-		// When a connection error occurs, a panic occurs and the system is shut down
-		panic(err)
+		log.Fatalf("Failed to create Kafka consumer: %v", err)
 	}
-
 	return c
 }
 
-var NUM_MSG int
-
-// My private and public key
-var sec bls.SecretKey
-var pub *bls.PublicKey
-
-// All nodes' private & public key
-var sigVec []bls.Sign
-var pubVec []bls.PublicKey
-
-// METRICS for PROMETHEUS MONITORING
-var counter = prometheus.NewCounter(
-	prometheus.CounterOpts{
+var (
+	counter = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "WDN_WNODE",
-		Name:      "WDN_counter",
-		Help:      "This is WDN counter",
+		Name:      "wdn_counter_total",
+		Help:      "Total count of WDN events",
 	})
 
-var gauge = prometheus.NewGauge(
-	prometheus.GaugeOpts{
+	gauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "WDN_WNODE",
-		Name:      "WDN_gauge",
-		Help:      "This is WDN gauge",
+		Name:      "wdn_gauge_value",
+		Help:      "Current gauge value of WDN",
 	})
 
-var histogram = prometheus.NewHistogram(
-	prometheus.HistogramOpts{
+	histogram = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "WDN_WNODE",
-		Name:      "WDN_histogram",
-		Help:      "This is WDN histogram",
+		Name:      "wdn_histogram_value",
+		Help:      "Histogram of WDN measurements",
+		Buckets:   prometheus.LinearBuckets(0, 5, 10), // 0~50까지 10버킷
 	})
+)
 
 func monitoring() {
 	const nGo = "/sched/goroutines:goroutines"
@@ -158,7 +151,6 @@ func monitoring() {
 	getMetric[1].Name = nMem
 
 	go func() {
-		// export the value want
 		for {
 			counter.Add(rd.Float64() * 5)
 			gauge.Add(rd.Float64()*15 - 5)
@@ -168,121 +160,129 @@ func monitoring() {
 			time.Sleep(2 * time.Second)
 		}
 	}()
-	fmt.Println(http.ListenAndServe(MPORT, nil))
+	fmt.Println(http.ListenAndServe(prometheusListenPort, nil))
 }
 
 func main() {
-	snode := flag.String("snode", "117.16.244.33", "")
-	kafka := flag.String("broker", "117.16.244.33", "")
-	libp2pAddr := flag.String("libp2p", "/ip4/117.16.244.33/tcp/4041/p2p/QmXCKbGHnpCjvArGzuejqwpYCt9p8qSmQfmBVp2LvrP1Sx", "")
-	ami := flag.Bool("ami", false, "")
-	chann := flag.String("channel", "mychannel", "")
+	defaultValidatorAddr := flag.String("snode", "117.16.244.33", "Validator node IP address")
+	kafkaProcessorAddr := flag.String("broker", "117.16.244.33", "Kafka broker IP address")
+	libp2pAddr := flag.String("libp2p", "/ip4/117.16.244.33/tcp/4001/p2p/QmeD4iQQJAjoAvaTwT3UbFqSZ5zMWJne7dk7519H1A4ML5", "Libp2p multiaddress")
+	ami := flag.Bool("ami", false, "AMI mode (leader)")
+	channel := flag.String("channel", "mychannel", "Channel name")
 
 	flag.Parse()
 
-	sAddr = *snode + ":16220"
-	sAddrNAT = *snode + ":11730"
+	validatorGrpcAddr = *defaultValidatorAddr + ":16220"
+	validatorNatAddr = *defaultValidatorAddr + ":11730"
 
-	brokers = *kafka + ":9091, " + *kafka + ":9092, " + *kafka + ":9093"
+	brokers = *kafkaProcessorAddr + ":9091," + *kafkaProcessorAddr + ":9092," + *kafkaProcessorAddr + ":9093"
 	leaderBro = *ami
-	leaderChan = *chann
+	leaderChan = *channel
 
-	var wNode WNODE
+	var consensusNode CONSENSUSNODE
 
-	LOGFILE := path.Join("./wnode.log")
-	f, err := os.OpenFile(LOGFILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile := "./wnode.log"
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("Failed to open log file: %v\n", err)
 		return
 	}
 	defer f.Close()
-	wNode = WNODE{
+
+	consensusNode = CONSENSUSNODE{
 		wlog:      log.New(f, "WLog ", log.LstdFlags),
-		isLeader:  make(chan bool),
 		leader:    false,
-		done:      make(chan bool),
+		done:      make(chan bool, 1),
 		blockMsg:  &pb.TransactionMsg{},
 		auditMsg:  &pb.AuditMsg{},
 		memberMsg: &pb.MemberMsg{},
 	}
-	wNode.wlog.Println("Start")
 
-	// GossipSub Channel Join within 3 second
+	consensusNode.wlog.Println("Start")
+
 	go wp2p.Start(true, *libp2pAddr, 4010)
 	time.Sleep(3 * time.Second)
-	// WDG ID is calculated by hashing IP address.
-	wNode.selfId = wp2p.Host
-	fmt.Println("[HOST ID]", wNode.selfId)
 
-	/*  Initialize BLS multi-signature
-	    Thus, w-node get his  secret key and public key
-	*/
+	consensusNode.selfId = wp2p.Host
+	fmt.Println("[HOST ID]", consensusNode.selfId)
+
 	bls.Init(bls.BLS12_381)
 	bls.SetETHmode(bls.EthModeDraft07)
 	sec.SetByCSPRNG()
 	pub = sec.GetPublicKey()
 
-	//  Export PROMETHEUS Metric for health check
 	http.Handle("/metrics", promhttp.Handler())
 	go monitoring()
 
-	myChannel := leaderChan
-	wp2p.JoinShard(myChannel)
+	wp2p.JoinShard(leaderChan)
 
-	//  Let's start to communicate with s-node
-	wNode.start()
+	consensusNode.start()
 }
 
-// func (w *WNODE) GetAddress() string {
-// 	// ifaces, _ := net.Interfaces()
-// 	// for _, i := range ifaces {
-// 	// 	// "eth0" or "eno1"
-// 	// 	if i.Name == "eth0" {
-// 	// 		addrs, _ := i.Addrs()
-// 	// 		for _, addr := range addrs {
-// 	// 			var ip net.IP
-// 	// 			switch v := addr.(type) {
-// 	// 			case *net.IPNet:
-// 	// 				ip = v.IP
-// 	// 			case *net.IPAddr:
-// 	// 				ip = v.IP
-// 	// 			}
-// 	// 			w.address = ip.String()
-// 	// 			return true
-// 	// 		}
-// 	// 	}
-// 	// }
-// }
+func (w *CONSENSUSNODE) GetAddress() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		w.wlog.Printf("Failed to get network interfaces: %v", err)
+		return ""
+	}
 
-func (w *WNODE) start() {
+	for _, iface := range ifaces {
+		// 도커 컨테이너 환경일 경우
+		// if iface.Name == "eth0" {
+		// 로컬 환경일 경우
+		if iface.Name == "eno1" {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				w.wlog.Printf("Failed to get addresses for interface %s: %v", iface.Name, err)
+				continue
+			}
+
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				// IPv4 주소만 반환
+				if ip != nil && ip.To4() != nil {
+					w.address = ip.String()
+					return w.address
+				}
+			}
+		}
+	}
+
+	w.wlog.Println("No suitable network interface found")
+	return ""
+}
+
+func (w *CONSENSUSNODE) start() {
 	go w.setLeaderChan(false, "")
 	go w.setDone(false)
 	w.leader = false
 
 	// [GossipSub: Tx Proposal Listening]
-	// 1. All w-nodes receive every round of Gissip round messages from s-nodes
-	// 2. All w-nodes receive every round of Gissip block messages from the leader
-	// 3. In other words, there are two message types (tpye-1) round msg (type-2) Block Msg
-	// go w.BlockListening()
+	// 1. All w-nodes receive every round of Gossip round messages from s-nodes (committee)
+	// 2. If leader, run block listening
+	// 3. Two message types: type-1 round msg, type-2 block msg (consensus)
 
 	go w.CommitteeListening()
-
-	// [QUIC: Consensus Message]
-	// 1. The leader node forwards the consensus message to all w-nodes
-	// 2. Each w-node is signed and delivered to the leader node
-	// 3. Wait for consensus message if you are not a leader
+	go w.BlockListening()
 	go w.ConsensusListening()
 
 	// [GRPC: Membership Message]
-	//	1. Report his network information
-	//	2. Get the information WDN Members
+	// 1. Report network info
+	// 2. Get WDN Members info
 	w.Reporting()
 
 	// To solve AWS NAT Problem (외부 IP 주소를 알려주기 위해)
-	time.Sleep(time.Second * 3)
+	time.Sleep(3 * time.Second)
 	ReportExternal(w.selfId)
+
 	for {
-		time.Sleep(time.Second * 10)
+		time.Sleep(10 * time.Second)
 		w.Reporting()
 	}
 }
@@ -295,57 +295,928 @@ func idxToInt(s string) int {
 
 // kafkaListener pulls reliable blocks from the Weave Kafka partition when
 // the peer is a leader.
-func (w *WNODE) KafkaListener(rekey string) {
 
-	c := Kafka()
-	c.SubscribeTopics([]string{rekey}, nil)
+func (w *CONSENSUSNODE) KafkaListener(rekey string) {
+	c := NewKafkaConsumer()
+	defer c.Close()
+	err := c.SubscribeTopics([]string{rekey}, nil)
+	if err != nil {
+		log.Printf("Failed to subscribe to topic %s: %v", rekey, err)
+		return
+	}
 
-	var userIDs []int
+	re := regexp.MustCompile(`User(\d+)`)
+
+	for {
+
+		msg, err := c.ReadMessage(-1)
+		if err != nil {
+			log.Printf("Kafka read error: %v", err)
+			continue
+		}
+
+		if !w.isLeader.Load() {
+			log.Println("Not leader: received message ignored")
+			continue
+		}
+
+		// 메시지 처리 코드 ...
+		var Abortdata []*common.Envelope
+		err = json.Unmarshal(msg.Value, &Abortdata)
+		if err != nil {
+			log.Printf("Failed to unmarshal Kafka message: %v", err)
+			continue
+		}
+
+		userIDs := []int{}
+		for _, env := range Abortdata {
+			payload, err := protoutil.UnmarshalTransaction(env.Payload)
+			if err != nil {
+				log.Printf("Failed to unmarshal transaction payload: %v", err)
+				continue
+			}
+
+			match := re.FindStringSubmatch(payload.String())
+			if len(match) > 1 {
+				idx := idxToInt(match[1])
+				userIDs = append(userIDs, idx)
+			}
+		}
+
+		userCount := make(map[string]int)
+		for _, id := range userIDs {
+			userKey := "User" + strconv.Itoa(id)
+			userCount[userKey]++
+		}
+
+		fmt.Println("User Count Map:", userCount)
+
+		w.auditMsg = &pb.AuditMsg{}
+		go w.bftConsensus(userCount)
+
+	}
+}
+
+func (w *CONSENSUSNODE) bftConsensus(userCount map[string]int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Construct initial consensus message
+	w.auditMsg = &pb.AuditMsg{
+		BlkNum:              w.roundIdx,
+		LeaderID:            w.selfId,
+		PhaseNum:            pb.AuditMsg_PREPARE,
+		MerkleRootHash:      "abcdefghijklmnopqrstuvwxyz",
+		AbortTransactionNum: userCount,
+		HonestAuditors:      []string{w.selfId},
+	}
+
+	// Hashing
+	if w.auditMsg.BlkNum == 1 {
+		w.auditMsg.CurHash = "ajknadajsnamajkndqwaakdmkaiwq"
+	} else {
+		hashBytes := lg.BlockHashCalculator(w.auditMsg)
+		hash := sha512.Sum512(hashBytes)
+		w.auditMsg.CurHash = hex.EncodeToString(hash[:63])
+	}
+
+	// Signature
+	signing := sec.SignByte([]byte(w.auditMsg.CurHash))
+	w.auditMsg.Signature = signing.Serialize()
+
+	// === 1st Phase: PREPARE ===
+	fmt.Println("🚀 Broadcasting PREPARE")
+	chPrepare := make(chan bool, len(w.members))
+	for _, each := range w.members {
+		go w.SubmitPrepare(chPrepare, each.Addr)
+	}
+
+	if waitForVotes(chPrepare, len(w.members)) {
+		fmt.Println("✅ PREPARE Quorum achieved")
+	} else {
+		fmt.Println("⚠️ PREPARE Quorum not achieved")
+	}
+	<-ctx.Done()
+
+	// === 2nd Phase: COMMIT ===
+	fmt.Println("🚀 Broadcasting COMMIT")
+	chCommit := make(chan bool, len(w.members))
+	for _, each := range w.members {
+		go w.SubmitCommit(chCommit, each.Addr)
+	}
+
+	if waitForVotes(chCommit, len(w.members)) {
+		fmt.Println("✅ COMMIT Quorum achieved")
+	} else {
+		fmt.Println("⚠️ COMMIT Quorum not achieved")
+	}
+	<-ctx.Done()
+
+	// === Final: Disseminate block ===
+	fmt.Println("📦 Disseminating block to peers")
+	gossipMsg := &pb.GossipMsg{
+		Type:   2,
+		Rndblk: w.auditMsg,
+	}
+	wp2p.WDNMessage(wp2p.Wctx, wp2p.Shard[0], gossipMsg)
+}
+
+func waitForVotes(ch chan bool, total int) bool {
+	votes := 0
+	quorum := 1 // TODO: replace with 2f+1 logic if needed
 
 	for {
 		select {
-		case done := <-w.done:
-			if done {
-				c.Close()
-				return
+		case <-ch:
+			votes++
+			fmt.Printf("🗳️ Votes: %d/%d\n", votes, total)
+			if votes >= quorum {
+				return true
 			}
 		default:
-			msg, err := c.ReadMessage(-1)
-			if err == nil {
-				var index = 0
-				var Abortdata []*common.Envelope
-				err := json.Unmarshal(msg.Value, &Abortdata)
-				if err != nil {
-					fmt.Println(err)
-				}
-				for i := range Abortdata {
-					payload, _ := protoutil.UnmarshalTransaction(Abortdata[i].Payload)
-					fmt.Println("③", payload)
-					re := regexp.MustCompile(`User(\d+)`)
-					match := re.FindStringSubmatch(payload.String())
-					if len(match) > 1 {
-						idx := match[1]
-						index = idxToInt(idx)
-						userIDs = append(userIDs, index)
-					}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+func (w *CONSENSUSNODE) setLeaderChan(isLeader bool, channel string) {
+	if w.channelID != channel {
+		w.channelID = channel
+	}
+	w.isLeader.Store(isLeader)
+}
+
+func (w *CONSENSUSNODE) setDone(b bool) {
+	w.done <- b
+}
+
+// Check if this peer is the leader; if so, it should receive messages from Kafka.
+// BlockListening listens for consensus-related block messages.
+func (w *CONSENSUSNODE) BlockListening() {
+	w.GetAddress()
+	listener, err := net.Listen("tcp", w.address+consensusPort)
+	if err != nil {
+		log.Fatalf("❌ Failed to listen on %s: %v", w.address+consensusPort, err)
+	}
+	defer listener.Close()
+
+	fmt.Println("📡 BlockListenIP:", w.address+consensusPort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("⚠️ Accept error:", err)
+			continue
+		}
+		go w.BloConnHandler(conn)
+	}
+}
+
+// BloConnHandler handles incoming consensus messages (leader/follower/block insertion).
+func (w *CONSENSUSNODE) BloConnHandler(conn net.Conn) {
+	defer conn.Close()
+
+	recvBuf := make([]byte, 8192)
+	n, err := conn.Read(recvBuf)
+	if err != nil {
+		if err == io.EOF {
+			log.Printf("🔌 Connection closed by client: %v", conn.RemoteAddr())
+		} else {
+			log.Printf("❌ Failed to read data: %v", err)
+		}
+		return
+	}
+
+	MsgRecv := &pb.GossipMsg{}
+	if err := json.Unmarshal(recvBuf[:n], MsgRecv); err != nil {
+		log.Printf("❌ Failed to unmarshal GossipMsg: %v", err)
+		return
+	}
+
+	fmt.Println("🏦 Received GossipMsg:", MsgRecv)
+
+	switch MsgRecv.GetType() {
+	case 1: // Leader/follower election message
+		w.roundIdx = MsgRecv.RndMsg.RoundNum
+		isLeader := (MsgRecv.RndMsg.LeaderID == w.selfId)
+
+		w.leader = isLeader
+		w.channelID = MsgRecv.Channel
+
+		if isLeader {
+			fmt.Println("👑 Elected as leader")
+			go w.setDone(false)
+			go w.KafkaListener(MsgRecv.Channel + "-abort")
+			w.isLeader.Store(true)
+		} else {
+			fmt.Println("🧩 Follower consensus node")
+			go w.setDone(true)
+			w.isLeader.Store(false)
+		}
+
+	case 2: // Block commit message
+		fmt.Println("📦 BLOCKINSERT: Committing block to ledger")
+		go lg.UserAbortInfoInsert(w.auditMsg)
+	}
+}
+
+// decide whether the peer is elected as a leader or not
+func (w *CONSENSUSNODE) CommitteeListening() {
+	w.GetAddress()
+	listener, err := net.Listen("tcp", w.address+gossipListenPort)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", w.address+gossipListenPort, err)
+	}
+	defer listener.Close()
+
+	fmt.Println("📡 CommitteeListenIP:", w.address+gossipListenPort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("⚠️ Accept error:", err)
+			continue
+		}
+		go w.CommConnHandler(conn)
+	}
+}
+
+func (w *CONSENSUSNODE) CommConnHandler(conn net.Conn) {
+	defer conn.Close()
+
+	recvBuf := make([]byte, 8192)
+	n, err := conn.Read(recvBuf)
+	if err != nil {
+		if err == io.EOF {
+			log.Printf("🔌 Connection closed by client: %v", conn.RemoteAddr())
+		} else {
+			log.Printf("❌ Failed to read data: %v", err)
+		}
+		return
+	}
+
+	recvMsg := &pb.CommitteeMsg{}
+	if err := json.Unmarshal(recvBuf[:n], recvMsg); err != nil {
+		log.Printf("❌ Failed to unmarshal CommitteeMsg: %v", err)
+		return
+	}
+
+	w.roundIdx = recvMsg.RoundNum
+
+	for _, shard := range recvMsg.Shards {
+		for _, mem := range shard.Member {
+			if mem.NodeID == w.selfId {
+				w.members = shard.Member
+
+				isLeader := (recvMsg.GetType() == 1 && shard.LeaderID == w.selfId)
+
+				w.leader = isLeader
+				w.channelID = leaderChan // use fixed ID if that is intended
+
+				if isLeader {
+					fmt.Println("👑 Elected as leader")
+					go w.setDone(false)
+					go w.KafkaListener(w.channelID + "-abort")
+					w.isLeader.Store(true)
+				} else {
+					fmt.Println("🧩 Follower consensus node")
+					go w.setDone(true)
+					w.isLeader.Store(false)
 				}
 
-				userCount := make(map[string]int)
+				return // exit after setting role
 
-				for _, id := range userIDs {
-					userKey := "User" + strconv.Itoa(id)
-					userCount[userKey]++
-				}
-
-				fmt.Println("User Count Map:", userCount)
-				w.auditMsg = &pb.AuditMsg{}
-				go w.bftConsensus(userCount)
+				// push := w.MP2BTPChildOnce()
+				// w.MP2BTPConsensusListening(push)
 			}
 		}
 	}
 }
 
-func (w *WNODE) bftConsensus(userCount map[string]int) {
+/*I'm a leader, send a message to a w-node*/
+func (w *CONSENSUSNODE) SubmitPrepare(ch chan<- bool, ip string) {
+	w.submitPhase(ch, ip, pb.AuditMsg_AGGREGATED_PREPARE)
+}
+
+func (w *CONSENSUSNODE) SubmitCommit(ch chan<- bool, ip string) {
+	w.submitPhase(ch, ip, pb.AuditMsg_AGGREGATED_COMMIT)
+}
+
+func (w *CONSENSUSNODE) submitPhase(ch chan<- bool, ip string, targetPhase pb.AuditMsg_Phases) {
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"quic-echo-example"},
+	}
+	session, err := quic.DialAddr(context.Background(), ip+gossipMsgPort, tlsConf, nil)
+	if err != nil {
+		log.Printf("❌ Failed to connect to %s: %v", ip, err)
+		ch <- false
+		return
+	}
+	defer session.CloseWithError(0, "")
+
+	stream, err := session.OpenStreamSync(context.Background())
+	if err != nil {
+		log.Printf("❌ Failed to open stream: %v", err)
+		ch <- false
+		return
+	}
+
+	sndBuf, err := json.Marshal(w.auditMsg)
+	if err != nil {
+		log.Printf("❌ Marshal error: %v", err)
+		ch <- false
+		return
+	}
+	_, err = stream.Write(sndBuf)
+	if err != nil {
+		log.Printf("❌ Write error: %v", err)
+		ch <- false
+		return
+	}
+
+	remoteIP := session.RemoteAddr().String()
+	fmt.Println("연결된 상대 IP:", remoteIP)
+
+	for {
+		rcvBuf := make([]byte, 8192)
+		n, err := stream.Read(rcvBuf)
+		if err != nil {
+			log.Printf("❌ Stream read error: %v", err)
+			ch <- false
+			return
+		}
+		if n == 0 {
+			continue
+		}
+
+		cMsgRecv := &pb.AuditMsg{}
+		if err := json.Unmarshal(rcvBuf[:n], cMsgRecv); err != nil {
+			log.Println("❌ JSON unmarshal error:", err)
+			continue
+		}
+
+		if cMsgRecv.PhaseNum != targetPhase {
+			continue
+		}
+
+		sig := bls.Sign{}
+		if err := sig.Deserialize(cMsgRecv.Signature); err != nil {
+			log.Println("❌ Signature deserialize error:", err)
+			continue
+		}
+		sigVec = append(sigVec, sig)
+		if len(sigVec) == len(w.memberMsg.Nodes) {
+			log.Printf("✅ Phase %v Aggregation Complete", targetPhase)
+			w.Multisinging(cMsgRecv, sigVec)
+			sigVec = sigVec[:0]
+			if targetPhase == pb.AuditMsg_AGGREGATED_PREPARE {
+				w.auditMsg.HonestAuditors = cMsgRecv.HonestAuditors
+			}
+			break
+		} else {
+			log.Printf("⏳ Waiting for more signatures: %d/%d", len(sigVec), len(w.memberMsg.Nodes))
+			continue
+		}
+	}
+
+	stream.Close()
+	ch <- true
+}
+
+/*Consensus three-phases: Announce(Completed State), Prepare, Commit] I'm not a leader*/
+func (w *CONSENSUSNODE) ConsensusListening() {
+
+	w.GetAddress()
+	listener, err := quic.ListenAddr(w.address+gossipMsgPort, generateTLSConfig(), nil)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		sess, err := listener.Accept(context.Background())
+		if err != nil {
+			panic(err)
+		}
+		stream, err := sess.AcceptStream(context.Background())
+		if err != nil {
+			panic(err)
+		}
+		go w.StreamHandler(stream)
+	}
+}
+
+func (w *CONSENSUSNODE) StreamHandler(stream quic.Stream) {
+
+	for {
+		rcvBuf := make([]byte, 8192)
+		n, err := stream.Read(rcvBuf)
+		if err != nil {
+			panic(err)
+		}
+
+		if n == 0 {
+			continue
+		}
+
+		rcvBuf = rcvBuf[:n]
+		cMsgRecv := &pb.AuditMsg{}
+		if err = json.Unmarshal(rcvBuf, cMsgRecv); err != nil {
+			fmt.Println(err)
+			continue
+		}
+
+		switch cMsgRecv.PhaseNum {
+		case pb.AuditMsg_PREPARE:
+			w.preparePhase(cMsgRecv)
+			w.sendResponse(stream)
+			return
+		case pb.AuditMsg_COMMIT:
+			if w.verifying(cMsgRecv) {
+				w.commitPhase(cMsgRecv)
+				w.sendResponse(stream)
+				return
+			}
+		default:
+			continue
+		}
+	}
+}
+
+func (w *CONSENSUSNODE) preparePhase(cMsg *pb.AuditMsg) {
+	hash := []byte(cMsg.CurHash)
+	signing := sec.SignByte(hash)
+	w.auditMsg.Signature = signing.Serialize()
+	w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_PREPARE
+	w.updateAuditFields(cMsg)
+}
+
+func (w *CONSENSUSNODE) commitPhase(cMsg *pb.AuditMsg) {
+	hash := []byte(cMsg.CurHash)
+	signing := sec.SignByte(hash)
+	w.auditMsg.Signature = signing.Serialize()
+	w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_COMMIT
+	w.updateAuditFields(cMsg)
+}
+
+func (w *CONSENSUSNODE) sendResponse(stream quic.Stream) {
+	fmt.Println(w.auditMsg)
+	sndBuf, err := json.Marshal(w.auditMsg)
+	if err != nil {
+		panic(err)
+	}
+	if _, err = stream.Write(sndBuf); err != nil {
+		panic(err)
+	}
+}
+
+func (w *CONSENSUSNODE) updateAuditFields(cMsg *pb.AuditMsg) {
+	w.auditMsg.CurHash = cMsg.CurHash
+	w.auditMsg.MerkleRootHash = cMsg.MerkleRootHash
+
+	alreadyExists := false
+	for _, id := range cMsg.HonestAuditors {
+		if id == w.selfId {
+			alreadyExists = true
+			break
+		}
+	}
+	if !alreadyExists {
+		w.auditMsg.HonestAuditors = append(cMsg.HonestAuditors, w.selfId)
+	} else {
+		w.auditMsg.HonestAuditors = cMsg.HonestAuditors
+	}
+}
+
+func (w *CONSENSUSNODE) verifying(cMsg *pb.AuditMsg) bool {
+	pubVec = pubVec[:0]
+
+	for _, honestID := range cMsg.HonestAuditors {
+		if pk := w.getPublicKeyByNodeID(honestID); pk != nil {
+			pubVec = append(pubVec, *pk)
+		} else {
+			fmt.Printf("Missing public key for node: %s\n", honestID)
+		}
+	}
+
+	fmt.Printf("👑 Phase: %v\n👑 Public Keys Count: %d\n👑 Public Keys: %v\n", cMsg.PhaseNum, len(pubVec), pubVec)
+
+	var decSign bls.Sign
+	if err := decSign.Deserialize(cMsg.Signature); err != nil {
+		fmt.Println("Signature deserialization error:", err)
+		return false
+	}
+
+	switch cMsg.PhaseNum {
+	case pb.AuditMsg_COMMIT:
+		if decSign.FastAggregateVerify(pubVec, []byte(cMsg.CurHash)) {
+			fmt.Println("✅ AGGREGATED_COMMIT: Verification SUCCESS")
+			return true
+		}
+		fmt.Println("❌ AGGREGATED_COMMIT: Verification ERROR")
+	}
+	return false
+}
+
+func (w *CONSENSUSNODE) getPublicKeyByNodeID(id string) *bls.PublicKey {
+	for _, node := range w.memberMsg.Nodes {
+		if node.NodeID == id {
+			dec := &bls.PublicKey{}
+			if err := dec.Deserialize(node.Publickey); err != nil {
+				fmt.Printf("Failed to deserialize public key for node %s: %v\n", id, err)
+				return nil
+			}
+			return dec
+		}
+	}
+	return nil
+}
+func (w *CONSENSUSNODE) Multisinging(cMsgs *pb.AuditMsg, sigVec []bls.Sign) (bool, int) {
+	switch cMsgs.PhaseNum {
+	case pb.AuditMsg_AGGREGATED_PREPARE:
+		return w.aggregateAndPrepare(cMsgs, sigVec), len(w.auditMsg.HonestAuditors)
+
+	case pb.AuditMsg_AGGREGATED_COMMIT:
+		return w.aggregateAndCommit(cMsgs, sigVec), len(w.auditMsg.HonestAuditors)
+
+	default:
+		return false, 0
+	}
+}
+
+func (w *CONSENSUSNODE) aggregateAndPrepare(cMsgs *pb.AuditMsg, sigVec []bls.Sign) bool {
+	return w.aggregateAndSet(cMsgs, sigVec, pb.AuditMsg_COMMIT)
+}
+
+func (w *CONSENSUSNODE) aggregateAndCommit(cMsgs *pb.AuditMsg, sigVec []bls.Sign) bool {
+	return w.aggregateAndSet(cMsgs, sigVec, pb.AuditMsg_AGGREGATED_COMMIT)
+}
+
+func (w *CONSENSUSNODE) aggregateAndSet(cMsgs *pb.AuditMsg, sigVec []bls.Sign, phase pb.AuditMsg_Phases) bool {
+	var aggeSign bls.Sign
+	aggeSign.Aggregate(sigVec)
+	byteSig := aggeSign.Serialize()
+
+	w.auditMsg.BlkNum = cMsgs.BlkNum
+	w.auditMsg.PrevHash = cMsgs.PrevHash
+	w.auditMsg.CurHash = cMsgs.CurHash
+	w.auditMsg.Signature = byteSig
+	w.auditMsg.PhaseNum = phase
+	return true
+}
+
+/*GRPC SERVICE Membershhip Exchanging Procedure*/
+func (w *CONSENSUSNODE) Reporting() {
+	conn, err := grpc.Dial(validatorGrpcAddr, grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		log.Fatalf("Failed to connect to validator gRPC server: %v", err)
+	}
+	defer conn.Close()
+
+	c := pb.NewMembershipServiceClient(conn)
+	req := createSelfMembership(w.selfId, pub.Serialize(), "11730")
+
+	w.memberMsg, err = c.GetMembership(context.Background(), req)
+	if err != nil {
+		log.Fatalf("Failed to get membership: %v", err)
+	}
+}
+
+func createSelfMembership(id string, pubKey []byte, port string) *pb.MemberMsg {
+	node := &pb.Node{
+		NodeID:    id,
+		Port:      port,
+		Publickey: pubKey,
+		Alive:     true,
+	}
+	return &pb.MemberMsg{Nodes: []*pb.Node{node}}
+}
+
+func MerkleHash(s []uint64) string {
+	return strconv.FormatUint(s[0], 16)
+}
+
+func ReportExternal(id string) {
+	conn, err := net.Dial("tcp", validatorNatAddr)
+	if err != nil {
+		fmt.Println("[NAT] Failed to dial:", err)
+		return
+	}
+	defer conn.Close()
+
+	sndBuf, err := json.Marshal(id)
+	if err != nil {
+		fmt.Println("[NAT] Failed to marshal ID:", err)
+		return
+	}
+
+	if _, err := conn.Write(sndBuf); err != nil {
+		fmt.Println("[NAT] Failed to write data:", err)
+	}
+}
+
+func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		panic(fmt.Errorf("failed to generate RSA key: %w", err))
+	}
+
+	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(fmt.Errorf("failed to create certificate: %w", err))
+	}
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(fmt.Errorf("failed to load TLS key pair: %w", err))
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"quic-echo-example"},
+	}
+}
+
+// MP2BTP + WDN
+
+// -------------------------------------------------------------------------------------- //
+var mu sync.Mutex
+
+func (w *CONSENSUSNODE) MP2BTPRootOnce(ch chan<- bool, addrs []string) *PuCtrl.PuCtrl {
+	mu.Lock()
+	defer mu.Unlock()
+	w.GetAddress()
+
+	peerId := rd.Intn(10) + 1
+
+	configFile := "./push_root.toml"
+	fmt.Println("MP2BTPSubmit IP:", addrs)
+
+	err := WriteTomlFile(configFile, w.address, addrs)
+	if err != nil {
+		fmt.Println("❌ TOML 파일 생성 실패:", err)
+		ch <- false
+		return nil
+	}
+
+	fmt.Println("✅ TOML 파일 생성 완료:", configFile)
+
+	var config PuCtrl.Config
+	if _, err := toml.DecodeFile(configFile, &config); err != nil {
+		panic(err)
+	}
+
+	pu := PuCtrl.CreatePuCtrl(configFile, uint32(peerId))
+
+	fmt.Println("🖥️", config.PEER_ADDRS, "🖥️")
+
+	nodeInfo := pu.GetNodeInfo(config.PEER_ADDRS)
+
+	pu.Listen()
+
+	time.Sleep(1 * time.Second)
+
+	pu.Connect(nodeInfo, byte(PuCtrl.PUSH_SESSION))
+
+	time.Sleep(1 * time.Second)
+	return pu
+}
+func (w *CONSENSUSNODE) MP2BTPSubmit(ch chan<- bool, pu *PuCtrl.PuCtrl) {
+
+	sndBuf, err := json.Marshal(w.auditMsg)
+	if err != nil {
+		fmt.Println("❌ JSON 직렬화 실패:", err)
+		ch <- false
+		return
+	}
+	pu.SendAuditMsg(sndBuf)
+	fmt.Println("💛FINISH", sndBuf, "💛FINISH")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resultCh := make(chan recvResult)
+	go receiveWorker(pu, resultCh)
+
+	for {
+		select {
+		case result := <-resultCh:
+			if result.err != nil {
+				fmt.Println("❌ Error:", result.err)
+				ch <- false
+				return
+			}
+			if result.buf == nil || len(result.buf) == 0 {
+				continue
+			}
+			datalength := int(result.buf[0])
+			if datalength > len(result.buf)-1 {
+				fmt.Println("⚠️ 데이터 길이 이상:", datalength)
+				ch <- false
+				return
+			}
+			resultData := make([]byte, datalength)
+			copy(resultData, result.buf[1:datalength+1])
+
+			fmt.Printf("📦 수신 (%d bytes): %v\n", datalength, resultData)
+			ch <- true
+			break
+
+		case <-ctx.Done():
+			fmt.Println("🛑 수신 시간 초과 또는 취소")
+			ch <- false
+			return
+		}
+		break
+	}
+
+}
+
+type recvResult struct {
+	n   int
+	err error
+	buf []byte
+}
+
+func receiveWorker(pu *PuCtrl.PuCtrl, resultCh chan<- recvResult) {
+	for {
+		buf := make([]byte, 8192)
+		buf, err := pu.ReceiveRaw(buf)
+		if err != nil {
+			resultCh <- recvResult{buf: nil, err: err}
+			return
+		}
+		resultCh <- recvResult{buf: buf, err: nil}
+	}
+}
+func (w *CONSENSUSNODE) MP2BTPChildOnce() *PuCtrl.PuCtrl {
+	fmt.Println("😬 Starting Consensus Child")
+
+	configFile := "./push_child.toml"
+	peerId := rd.Intn(10) + 1
+
+	if _, err := toml.DecodeFile(configFile, new(PuCtrl.Config)); err != nil {
+		fmt.Println("❌ Config 파일 파싱 실패:", err)
+		return nil
+	}
+
+	pu := PuCtrl.CreatePuCtrl(configFile, uint32(peerId))
+
+	time.Sleep(1 * time.Second)
+
+	pu.Listen()
+
+	time.Sleep(1 * time.Second)
+	return pu
+}
+
+func (w *CONSENSUSNODE) MP2BTPConsensusListening(pu *PuCtrl.PuCtrl) {
+
+	s, _ := os.Create(fmt.Sprintf("log.txt"))
+	defer s.Close()
+
+	startTime := time.Now()
+	recvBytes := 0
+	datalength := 0
+	resultData := make([]byte, datalength)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resultCh := make(chan recvResult)
+	go receiveWorker(pu, resultCh)
+
+	for {
+		select {
+		case result := <-resultCh:
+			if result.err != nil {
+				fmt.Println("❌ Error:", result.err)
+				return
+			}
+			if result.buf == nil || len(result.buf) == 0 {
+				continue
+			}
+			fmt.Println("⭐️")
+			datalength = int(result.buf[0])
+			if datalength > len(result.buf)-1 {
+				fmt.Println("⚠️ 데이터 길이 이상:", datalength)
+				return
+			}
+
+			copy(resultData, result.buf[1:datalength+1])
+			fmt.Printf("📦 수신 (%d bytes): %v\n", datalength, resultData)
+			break
+
+		case <-ctx.Done():
+			fmt.Println("🛑 수신 시간 초과 또는 취소")
+			return
+		}
+		break
+	}
+
+	elapsedTime := time.Since(startTime)
+	throughput := (float64(recvBytes) * 8.0) / elapsedTime.Seconds() / (1000 * 1000)
+	logStr := fmt.Sprintf("Seconds=%f, Throughput=%f, ReceivedSize=%d\n", elapsedTime.Seconds(), throughput, recvBytes)
+	s.Write([]byte(logStr))
+
+	var auditMsg pb.AuditMsg
+	fmt.Println(datalength, resultData[1:datalength+1])
+	if err := json.Unmarshal(resultData[1:datalength+1], &auditMsg); err != nil {
+		fmt.Println("Unmarshal error:", err)
+	}
+
+	if auditMsg.PhaseNum == pb.AuditMsg_PREPARE {
+		hash := []byte(auditMsg.PrevHash)
+		signing := sec.SignByte(hash)
+		byteSig := signing.Serialize()
+		w.auditMsg.Signature = byteSig
+		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_PREPARE
+	}
+
+	if auditMsg.PhaseNum == pb.AuditMsg_COMMIT {
+		hash := []byte(auditMsg.PrevHash)
+		signing := sec.SignByte(hash)
+		byteSig := signing.Serialize()
+		w.auditMsg.Signature = byteSig
+		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_COMMIT
+	}
+
+	sndBuf, err := json.Marshal(w.auditMsg)
+	if err != nil {
+		panic(err)
+	}
+	err = pu.SendAuditMsg(sndBuf)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// -------------------------------------------------------------------------------------- //
+
+func WriteTomlFile(fileName string, myIP string, addrs []string) error {
+	_ = os.Remove(fileName)
+	f, err := os.Create(fileName)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fixedConfig := fmt.Sprintf(`# MP2BTP Configurations
+VERBOSE_MODE        = true
+NUM_MULTIPATH       = 1
+MY_IP_ADDRS         = ["%s", "127.0.0.1"]
+LISTEN_PORT         = 4000
+BIND_PORT           = 5000
+EQUIC_ENABLE        = true
+EQUIC_PATH          = "./fectun"
+EQUIC_APP_SRC_PORT  = 6000
+EQUIC_APP_DST_PORT  = 5000
+EQUIC_TUN_SRC_PORT  = 7000
+EQUIC_TUN_DST_PORT  = 7000
+EQUIC_FEC_MODE      = false
+SEGMENT_SIZE        = 2097152  
+FEC_SEGMENT_SIZE    = 2466816  
+THROUGHPUT_PERIOD = 0.1
+THROUGHPUT_WEIGHT = 0.1
+MULTIPATH_THRESHOLD_THROUGHPUT = 100.0
+MULTIPATH_THRESHOLD_SEND_COMPLETE_TIME = 0.0000000001
+CLOSE_TIMEOUT_PERIOD = 200
+`, myIP)
+	_, err = f.WriteString(fixedConfig)
+	if err != nil {
+		return err
+	}
+
+	// [[peer_addr]]
+	selfBlock := fmt.Sprintf(
+		"\n[[peer_addr]]  # Offset=0\nAddr = \"%s\"\nNumChild = %d\nChildOffset = 1\n",
+		myIP,
+		len(addrs),
+	)
+	_, err = f.WriteString(selfBlock)
+	if err != nil {
+		return err
+	}
+
+	// 2. 나머지 peer addr들 작성 (Offset=1부터 시작)
+	for i, addr := range addrs {
+		block := fmt.Sprintf(
+			"\n[[peer_addr]]  # Offset=%d\nAddr = \"%s\"\nNumChild = 0\nChildOffset = 0\n",
+			i+1, addr,
+		)
+		_, err := f.WriteString(block)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (w *CONSENSUSNODE) MP2BTPbftConsensus(userCount map[string]int) {
 	// Consensus Timer Setup
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(10)*time.Second)
@@ -381,10 +1252,8 @@ func (w *WNODE) bftConsensus(userCount map[string]int) {
 	// [Send the first consensus message] Send sensus message to each w-node
 	// When the settlement time expires, the message transfer goroutin ends
 	ch1 := make(chan bool, len(w.members))
-	for _, each := range w.members {
-		wnodeIP := each.Addr
-		go w.SubmitPrepare(ch1, wnodeIP)
-	}
+
+	go w.MP2BTPSubmit(ch1, MP2BTPsession)
 
 	// 2f+1 messages must be processed to send a second consensus message
 	// [Second consensual message] Send consensus message to each w-node
@@ -400,17 +1269,12 @@ func (w *WNODE) bftConsensus(userCount map[string]int) {
 			break
 		}
 	}
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(10 * time.Millisecond):
-	}
+	<-ctx.Done()
+	fmt.Println("✅ 응답 받음1, 다음 작업 진행")
 
 	ch2 := make(chan bool, len(w.members))
-	for _, each := range w.members {
-		wnodeIP := each.Addr
-		go w.SubmitCommit(ch2, wnodeIP)
-	}
+
+	go w.MP2BTPSubmit(ch2, MP2BTPsession)
 
 	// Final block commitment only if 2f+1 message is successful
 	// Send sensus message to each w-node
@@ -420,18 +1284,18 @@ func (w *WNODE) bftConsensus(userCount map[string]int) {
 		select {
 		case <-ch2:
 			votes += 1
+			fmt.Println("⭐️", votes)
 		}
 		if votes == len(w.members) {
+			fmt.Println(votes)
 			break
 		}
+		fmt.Println(votes)
 	}
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(10 * time.Millisecond):
-		// go lg.BlkInsert(w.auditMsg)
-		go lg.UserAbortInfoInsert(w.auditMsg)
-	}
+	<-ctx.Done()
+	fmt.Println("✅ 응답 받음2, 다음 작업 진행")
+
+	go w.MP2BTPSubmit(ch2, MP2BTPsession)
 
 	// when the consensus was successfully done, disseminate
 	// the block to the w-nodes.
@@ -439,400 +1303,4 @@ func (w *WNODE) bftConsensus(userCount map[string]int) {
 	gossibMsg.Type = 2
 	gossibMsg.Rndblk = w.auditMsg
 	wp2p.WDNMessage(wp2p.Wctx, wp2p.Shard[0], gossibMsg)
-}
-
-func (w *WNODE) setLeaderChan(b bool, channel string) {
-	if w.channelID != channel {
-		w.channelID = channel
-	}
-	w.isLeader <- b
-}
-
-func (w *WNODE) setDone(b bool) {
-	w.done <- b
-}
-
-// decide whether the peer is elected as a leader or not
-func (w *WNODE) BlockListening() {
-	l, err := net.Listen("tcp", "localhost"+GPORT)
-	if nil != err {
-		log.Println(err)
-	}
-	defer l.Close()
-
-	for {
-		conn, err := l.Accept()
-		if nil != err {
-			log.Println(err)
-			continue
-		}
-		go w.ConnHandler(conn)
-	}
-}
-
-func (w *WNODE) ConnHandler(conn net.Conn) {
-	defer conn.Close()
-	recvBuf := make([]byte, 8192)
-	n, err := conn.Read(recvBuf)
-	data := recvBuf[:n]
-	if nil != err {
-		if io.EOF == err {
-			log.Printf("connection is closed from client; %v", conn.RemoteAddr().String())
-			return
-		}
-		log.Printf("fail to receive data; err: %v", err)
-		return
-	}
-
-	MsgRecv := &pb.GossipMsg{}
-	json.Unmarshal(data, MsgRecv)
-
-	w.roundIdx = MsgRecv.RndMsg.RoundNum
-
-	// Start to make a consensus if I'm a leader
-
-	fmt.Println(MsgRecv.RndMsg.LeaderID)
-
-	if MsgRecv.GetType() == 1 && MsgRecv.RndMsg.LeaderID == w.selfId {
-		if !w.leader {
-			w.leader = true
-			w.channelID = MsgRecv.Channel
-
-			go w.setDone(false)
-			go w.setLeaderChan(true, MsgRecv.Channel)
-
-			go w.KafkaListener(MsgRecv.Channel + "-abort")
-		}
-	} else if MsgRecv.GetType() == 1 && MsgRecv.RndMsg.LeaderID != w.selfId {
-		w.leader = false
-		go w.setDone(true)
-		go w.setLeaderChan(false, "")
-	}
-
-	// Commit the block in their own ledger
-	if MsgRecv.GetType() == 2 {
-		// go lg.BlkInsert(MsgRecv.Rndblk)
-		go lg.UserAbortInfoInsert(w.auditMsg)
-	}
-}
-
-// decide whether the peer is elected as a leader or not
-func (w *WNODE) CommitteeListening() {
-	l, _ := net.Listen("tcp", "localhost"+GPORT)
-	defer l.Close()
-	for {
-		conn, err := l.Accept()
-		if nil != err {
-			log.Println(err)
-			continue
-		}
-
-		go w.CommConnHandler(conn)
-	}
-}
-
-func (w *WNODE) CommConnHandler(conn net.Conn) {
-	defer conn.Close()
-	recvBuf := make([]byte, 8192)
-	n, err := conn.Read(recvBuf)
-	data := recvBuf[:n]
-	if nil != err {
-		if io.EOF == err {
-			log.Printf("connection is closed from client; %v", conn.RemoteAddr().String())
-			return
-		}
-		log.Printf("fail to receive data; err: %v", err)
-		return
-	}
-	recvMsg := &pb.CommitteeMsg{}
-	json.Unmarshal(data, recvMsg)
-
-	w.roundIdx = recvMsg.RoundNum
-
-	var community pb.Shard
-
-	for _, shard := range recvMsg.Shards {
-		for _, mem := range shard.Member {
-			if mem.NodeID == w.selfId {
-				w.members = shard.Member
-				community = *shard
-				if recvMsg.GetType() == 1 && community.LeaderID == w.selfId {
-
-					if !w.leader {
-						w.leader = true
-						w.channelID = community.ID
-						w.channelID = leaderChan
-
-						go w.setDone(false)
-						go w.setLeaderChan(true, w.channelID)
-
-						go w.KafkaListener(w.channelID + "-abort")
-					}
-				} else {
-					w.leader = false
-					w.channelID = community.ID
-					w.channelID = leaderChan
-
-					go w.setDone(true)
-					go w.setLeaderChan(false, "")
-				}
-
-			}
-		}
-	}
-}
-
-/*I'm a leader, send a message to a w-node*/
-func (w *WNODE) SubmitPrepare(ch chan<- bool, ip string) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"quic-echo-example"},
-	}
-	session, err := quic.DialAddr(context.Background(), addrL+LPORT, tlsConf, nil)
-	if err != nil {
-		panic(err)
-	}
-	stream, err := session.OpenStreamSync(context.Background())
-	if err != nil {
-		panic(err)
-	}
-	sndBuf, err := json.Marshal(w.auditMsg)
-	if err != nil {
-		panic(err)
-	}
-	_, err = stream.Write(sndBuf)
-	if err != nil {
-		panic(err)
-	}
-
-	/* Wait for consensus response */
-	cMsgRecv := &pb.AuditMsg{}
-	rcvBuf := make([]byte, 8192)
-
-	_, err = stream.Read(rcvBuf)
-	if err != nil {
-		panic(err)
-	}
-	json.Unmarshal(rcvBuf, cMsgRecv)
-
-	err = stream.Close()
-	if err != nil {
-		panic(err)
-	}
-	ch <- true
-}
-
-/* I'm a leader, send a message to a w-node*/
-func (w *WNODE) SubmitCommit(ch chan<- bool, ip string) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"quic-echo-example"},
-	}
-	// addrN: Audit Leader IP/PORT
-	session, err := quic.DialAddr(context.Background(), "localhost"+LPORT, tlsConf, nil) // addrN
-	if err != nil {
-		panic(err)
-	}
-	stream, err := session.OpenStreamSync(context.Background())
-	if err != nil {
-		panic(err)
-	}
-	sndBuf, err := json.Marshal(w.auditMsg)
-	if err != nil {
-		panic(err)
-	}
-	_, err = stream.Write(sndBuf)
-	if err != nil {
-		panic(err)
-	}
-
-	cMsgRecv := &pb.AuditMsg{}
-	rcvBuf := make([]byte, 8192)
-
-	_, err = stream.Read(rcvBuf)
-	if err != nil {
-		panic(err)
-	}
-	json.Unmarshal(rcvBuf, cMsgRecv)
-	err = stream.Close()
-	if err != nil {
-		panic(err)
-	}
-	ch <- true
-}
-
-/*Consensus three-phases: Announce(Completed State), Prepare, Commit] I'm not a leader*/
-func (w *WNODE) ConsensusListening() {
-	listener, err := quic.ListenAddr(w.address+LPORT, generateTLSConfig(), nil)
-	if err != nil {
-		panic(err)
-	}
-	for {
-		sess, err := listener.Accept(context.Background())
-		if err != nil {
-			panic(err)
-		}
-		stream, err := sess.AcceptStream(context.Background())
-		if err != nil {
-			panic(err)
-		}
-		go w.StreamHandler(stream)
-	}
-}
-func (w *WNODE) StreamHandler(stream quic.Stream) {
-	rcvBuf := make([]byte, 8192)
-	cMsgRecv := &pb.AuditMsg{}
-	_, err := stream.Read(rcvBuf)
-	if err != nil {
-		if io.EOF == err {
-			return
-		}
-		log.Printf("fail to receive data; err: %v", err)
-	}
-	json.Unmarshal(rcvBuf, cMsgRecv)
-
-	if cMsgRecv.PhaseNum == pb.AuditMsg_PREPARE {
-		hash := []byte(cMsgRecv.PrevHash)
-		signing := sec.SignByte(hash)
-		byteSig := signing.Serialize()
-		w.auditMsg.Signature = byteSig
-		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_PREPARE
-	}
-
-	if cMsgRecv.PhaseNum == pb.AuditMsg_COMMIT {
-		hash := []byte(cMsgRecv.PrevHash)
-		signing := sec.SignByte(hash)
-		byteSig := signing.Serialize()
-		w.auditMsg.Signature = byteSig
-		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_COMMIT
-	}
-
-	sndBuf, err := json.Marshal(w.auditMsg)
-	if err != nil {
-		panic(err)
-	}
-	_, err = stream.Write(sndBuf)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func (w *WNODE) SendAggregatedMsg(stream quic.Stream) {
-	sndBuf, err := proto.Marshal(w.auditMsg)
-	if err != nil {
-		panic(err)
-	}
-	_, err = stream.Write(sndBuf)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func (w *WNODE) Multisinging(cMsgs *pb.AuditMsg) (bool, int) {
-	if cMsgs.PhaseNum == pb.AuditMsg_PREPARE {
-		fmt.Println("............................... L-Node Phase 1")
-		// Multi-Signature Signing
-		var aggeSign bls.Sign
-		aggeSign.Aggregate(sigVec)
-		sigVec = sigVec[:0]
-		byteSig := aggeSign.Serialize()
-
-		w.auditMsg.BlkNum = cMsgs.BlkNum
-		w.auditMsg.PrevHash = cMsgs.PrevHash
-		w.auditMsg.CurHash = cMsgs.CurHash
-		w.auditMsg.Signature = byteSig
-		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_PREPARE
-
-		return true, len(w.auditMsg.HonestAuditors)
-	}
-	if cMsgs.PhaseNum == pb.AuditMsg_COMMIT {
-		fmt.Println("............................... L-Node Phase 2")
-		// Multi-Signature Signing
-		var aggeSign bls.Sign
-		aggeSign.Aggregate(sigVec)
-		sigVec = sigVec[:0]
-		byteSig := aggeSign.Serialize()
-
-		w.auditMsg.BlkNum = cMsgs.BlkNum
-		w.auditMsg.PrevHash = cMsgs.PrevHash
-		w.auditMsg.CurHash = cMsgs.CurHash
-
-		// Next LeaderID
-		fmt.Println("L-Node ID:", w.memberMsg.LeaderID)
-
-		w.auditMsg.Signature = byteSig
-		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_COMMIT
-		return true, len(w.auditMsg.HonestAuditors)
-	}
-	return false, 0
-}
-
-/*GRPC SERVICE Membershhip Exchanging Procedure*/
-func (w *WNODE) Reporting() {
-	conn, err := grpc.Dial(sAddr, grpc.WithInsecure(), grpc.WithBlock())
-	if err != nil {
-		log.Fatalf("did not connect: %v", err)
-	}
-	defer conn.Close()
-	c := pb.NewMembershipServiceClient(conn)
-	Membership := &pb.MemberMsg{}
-	node := new(pb.Node)
-	node.NodeID = w.selfId
-	node.Port = "11730" // listening port when the leader is elected
-	bytePub := pub.Serialize()
-	node.Publickey = bytePub
-	node.Alive = true
-	// Send my info to S-node
-	Membership.Nodes = append(Membership.Nodes, node)
-
-	// Send your membership information, receive all w-nodes membership
-	w.memberMsg, err = c.GetMembership(context.Background(), Membership)
-	if err != nil {
-		log.Fatalf("could not greet: %v", err)
-	}
-}
-
-func MerkleHash(s []uint64) string {
-	ss := int64(s[0])
-	xx := strconv.FormatInt(ss, 16)
-	return xx
-}
-
-func ReportExternal(id string) {
-	sndBuf, _ := json.Marshal(id)
-	conn, err := net.Dial("tcp", sAddrNAT)
-	if err != nil {
-		fmt.Println("[NAT] Faield to Dial : ", err)
-	}
-	defer conn.Close()
-	_, err = conn.Write(sndBuf)
-
-	if err != nil {
-		fmt.Println("[NAT] Failed to write data : ", err)
-	}
-	_ = conn.Close()
-}
-
-/* Setup a bare-bones TLS config for the server --------------------------------------------------------------------- */
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{SerialNumber: big.NewInt(1)}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"quic-echo-example"},
-	}
 }

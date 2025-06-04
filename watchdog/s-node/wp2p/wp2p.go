@@ -28,7 +28,15 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/google/uuid"
 )
+
+var brokers = ""
+
+var kafkaPro *kafka.Producer
+var kafkaCon *kafka.Consumer
 
 type WatchdogPubsub struct {
 	ctx   context.Context
@@ -131,7 +139,7 @@ func (wp *WatchdogPubsub) Start(processorIP *string) {
 
 	r := rand.Reader
 
-	h, err := makeHost(4041, r)
+	h, err := makeHost(*processorIP, 4001, r)
 	if err != nil {
 		wp.ctx.Done()
 		panic(err)
@@ -186,17 +194,32 @@ func (wp *WatchdogPubsub) Start(processorIP *string) {
 		Transport: roundTripper,
 	}
 
+	body := &bytes.Buffer{}
 	for {
-		processorAddr := "https://" + *processorIP + ":8000/fabric/channels"
+		processorAddr := "https://" + *processorIP + ":8082/fabric/channels"
 
-		rsp, err := hclient.Get(processorAddr)
+		var resp *http.Response
+		var err error
+
+		// 시도 1: QUIC (HTTP/3)
+		resp, err = hclient.Get(processorAddr)
 		if err != nil {
-			fmt.Println(err)
-			continue
+			fmt.Println("QUIC HTTP/3 GET error:", err)
+
+			// 시도 2: fallback to HTTP/1.1
+			fallbackClient := &http.Client{Timeout: 2 * time.Second}
+			fallbackAddr := "http://" + *processorIP + ":8082/fabric/channels"
+			resp, err = fallbackClient.Get(fallbackAddr)
+			if err != nil {
+				fmt.Println("HTTP/1.1 fallback failed:", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
 		}
 
-		body := &bytes.Buffer{}
-		_, err = io.Copy(body, rsp.Body)
+		body = &bytes.Buffer{}
+		_, err = io.Copy(body, resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -244,11 +267,156 @@ func existChannel(channel string) bool {
 	return false
 }
 
-func makeHost(port int, randomness io.Reader) (host.Host, error) {
-	// Creates a new RSA key pair for this host.
-	prvKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, randomness)
+func KafkaCon() *kafka.Consumer {
+
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": brokers,
+		"group.id":          "myGroup" + uuid.NewString(),
+		"auto.offset.reset": "earliest",
+	})
+
 	if err != nil {
-		log.Println(err)
+		// When a connection error occurs, a panic occurs and the system is shut down
+		panic(err)
+	}
+
+	return c
+}
+
+func KafkaPro() *kafka.Producer {
+
+	p, _ := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": brokers,
+		"acks":              "all",
+		"message.max.bytes": 104857600,
+	})
+
+	return p
+}
+
+func LoadOrCreateKey(kafkaprocessorAddr string) (crypto.PrivKey, error) {
+
+	brokers = kafkaprocessorAddr + ":9091, " + kafkaprocessorAddr + ":9092, " + kafkaprocessorAddr + ":9093"
+	// 이거 토픽도 없으면 만들도록 해야하는데..!!
+	topic := "snode-keys"
+	// 하드 코딩 말고 채널이름 받도록 하고싶음.
+	channel := "mychannel"
+
+	privKey, err := GetOrCreateSnodePrivateKey(brokers, topic, channel)
+	if err != nil {
+		panic(err)
+	}
+
+	return privKey, nil
+}
+
+func GetOrCreateSnodePrivateKey(brokerAddr, topic, channel string) (crypto.PrivKey, error) {
+	privKey, err := getSnodePrivateKeyFromKafka(brokerAddr, topic, channel)
+	if err != nil {
+		return nil, err
+	}
+
+	if privKey != nil {
+		fmt.Println("Private key loaded from Kafka for channel:", channel, privKey)
+		return privKey, nil
+	}
+
+	privKey, _, err = crypto.GenerateKeyPair(crypto.RSA, 2048)
+	if err != nil {
+		return nil, err
+	}
+
+	err = saveSnodePrivateKeyToKafka(brokerAddr, topic, channel, privKey)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Println("New private key generated and saved to Kafka for channel:", channel, privKey)
+	return privKey, nil
+}
+
+func getSnodePrivateKeyFromKafka(brokerAddr, topic, channel string) (crypto.PrivKey, error) {
+	c := KafkaCon()
+	defer c.Close()
+
+	err := c.SubscribeTopics([]string{topic}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to subscribe to topic: %w", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			return nil, nil
+		default:
+			msg, err := c.ReadMessage(100 * time.Millisecond)
+			if err != nil {
+				continue
+			}
+			if string(msg.Key) == channel {
+
+				privKey, err := crypto.UnmarshalPrivateKey(msg.Value)
+				if err != nil {
+					return nil, fmt.Errorf("failed to unmarshal private key: %w", err)
+				}
+				return privKey, nil
+			}
+		}
+	}
+}
+
+func saveSnodePrivateKeyToKafka(brokerAddr, topic, channel string, privKey crypto.PrivKey) error {
+
+	keyBytes, err := crypto.MarshalPrivateKey(privKey)
+	if err != nil {
+		return err
+	}
+
+	producer, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": brokerAddr})
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+
+	msg := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Key:            []byte(channel),
+		Value:          keyBytes,
+	}
+
+	deliveryChan := make(chan kafka.Event)
+
+	err = producer.Produce(msg, deliveryChan)
+	if err != nil {
+		return fmt.Errorf("failed to produce message: %w", err)
+	}
+
+	e := <-deliveryChan
+	m := e.(*kafka.Message)
+	close(deliveryChan)
+
+	if m.TopicPartition.Error != nil {
+		return fmt.Errorf("delivery failed: %w", m.TopicPartition.Error)
+	}
+
+	fmt.Printf("Message delivered to topic %s [partition %d] at offset %v with key '%s'\n",
+		*m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset, string(m.Key))
+
+	return nil
+}
+
+func makeHost(kafkaIp string, port int, randomness io.Reader) (host.Host, error) {
+	// (default)Creates a new RSA key pair for this host.
+	// prvKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, randomness)
+	// if err != nil {
+	// 	log.Println(err)
+	// 	return nil, err
+	// }
+
+	// multiple stateless snode
+	prvKey, err := LoadOrCreateKey(kafkaIp)
+	if err != nil {
 		return nil, err
 	}
 

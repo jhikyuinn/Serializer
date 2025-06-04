@@ -1,10 +1,13 @@
 package __
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path"
+	"sort"
 	"sync"
 	"time"
 
@@ -27,6 +30,9 @@ var round_idx uint32
 var Membership = &pb.MemberMsg{} // *pb.MemberMsg
 var RwM = new(sync.RWMutex)      // Membership RW Mutex
 
+// Maximum number of committee members
+const maxCommitteeSize = 5
+
 func Start() {
 	LOGFILE := path.Join("./snode.log")
 	f, err := os.OpenFile(LOGFILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -46,79 +52,11 @@ func Start() {
 	go setNextRound()
 }
 
-func FormCommittee() {
-	fmt.Println("Formming committees ...")
-
-	RwM.Lock()
-	defer RwM.Unlock()
-
-	committeeExist := false
-
-	if len(Membership.Nodes) == 0 {
-		return
-	}
-
-	for _, jc := range wp2p.JoinedChannels.ID {
-		aliveNodes := []pb.Committee{}
-
-		// LOGIC: append one node for each channel for now
-		nodes := Membership.Nodes
-		for _, each := range nodes {
-			if each.Alive {
-				aliveNode := pb.Committee{}
-				aliveNode.NodeID = each.NodeID
-				aliveNode.Addr = each.Addr
-				aliveNode.Port = each.Port
-				aliveNode.Publickey = each.Publickey
-
-				aliveNodes = append(aliveNodes, aliveNode)
-			}
-		}
-
-		// randomly select committee members within alive nodes
-		var mem []pb.Committee
-		for i := 0; i < len(aliveNodes); i++ {
-			mem = append(mem, aliveNodes[i])
-
-			if len(mem) >= 10 {
-				break
-			}
-		}
-
-		if len(Watchdogs) == 0 {
-			Watchdogs = append(Watchdogs, WatchdogCommittee{
-				ChannelID: jc,
-				Members:   mem,
-			})
-
-			fmt.Println("New joined channel:", jc)
-			continue
-		}
-
-		for i, comm := range Watchdogs {
-			if jc == comm.ChannelID {
-				Watchdogs[i].Members = mem
-				committeeExist = true
-			}
-		}
-
-		if !committeeExist {
-			Watchdogs = append(Watchdogs, WatchdogCommittee{
-				ChannelID: jc,
-				Members:   mem,
-			})
-			fmt.Println("New joined channel:", jc)
-			continue
-		}
-	}
-
-	for _, w := range Watchdogs {
-		fmt.Printf("[%s]", w.ChannelID)
-		for _, n := range w.Members {
-			fmt.Printf("=> %s ", n.NodeID)
-		}
-		fmt.Println()
-	}
+// Placeholder for VRF function (to be replaced with actual VRF implementation including proof).
+// Will be migrated to open source later.
+func VRFHash(nodeID, seed string) *big.Int {
+	hash := sha256.Sum256([]byte(nodeID + seed))
+	return new(big.Int).SetBytes(hash[:])
 }
 
 // setNextRound publishes new membership information in the shard
@@ -140,15 +78,22 @@ func setNextRound() {
 	committeeMsg.Type = 1
 	committeeMsg.RoundNum = round_idx
 
-	// LOGIC: Repeat as many topics currently subscribed and randomly select among W-Nodes to deliver channel information to those nodes
+	// LOGIC: For each subscribed topic, use VRF to deterministically and fairly select a subset of W-Nodes as the committee,
+	// and also use VRF to select a leader node from within the committee.
 	for _, t := range wp2p.WatchdogTopics.Topics {
 		RwM.RLock()
 
 		shardMsg := &pb.Shard{}
 		shardMsg.ID = t.ID
 
-		nodes := Membership.Nodes
-		for _, each := range nodes {
+		seed := shardMsg.ID + string(committeeMsg.RoundNum) //
+		fmt.Println(seed)
+		var candidates []struct {
+			Node *pb.Wnode
+			VRF  *big.Int
+		}
+
+		for _, each := range Membership.Nodes {
 			if each.Alive {
 
 				commMember := &pb.Wnode{}
@@ -158,24 +103,39 @@ func setNextRound() {
 				commMember.Publickey = each.Publickey
 				commMember.Channel = each.Channel
 
-				shardMsg.Member = append(shardMsg.Member, commMember)
-			} else {
-				fmt.Println("DIED:", each.NodeID)
+				vrfVal := VRFHash(each.NodeID, seed)
+				candidates = append(candidates, struct {
+					Node *pb.Wnode
+					VRF  *big.Int
+				}{commMember, vrfVal})
 			}
 		}
 
 		RwM.RUnlock()
 
-		shardMsg.Member = makeNodeUnique(shardMsg.Member)
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].VRF.Cmp(candidates[j].VRF) < 0
+		})
 
-		fmt.Printf("[%s] => %d members\n", shardMsg.ID, len(shardMsg.Member))
-
-		if len(shardMsg.Member) == 0 {
-			break
+		for i := 0; i < len(candidates) && i < maxCommitteeSize; i++ {
+			shardMsg.Member = append(shardMsg.Member, candidates[i].Node)
 		}
 
-		// select leader node for the channel (i.e., dApp)
-		shardMsg.LeaderID = shardMsg.Member[len(shardMsg.Member)-1].NodeID
+		fmt.Printf("[%s] => selected %d committee members (from %d alive nodes)\n", shardMsg.ID, len(shardMsg.Member), len(candidates))
+
+		var leaderNodeID string
+		var lowestVRF *big.Int
+
+		for _, member := range shardMsg.Member {
+			vrf := VRFHash(member.NodeID, seed+"-leader")
+
+			if lowestVRF == nil || vrf.Cmp(lowestVRF) < 0 {
+				lowestVRF = vrf
+				leaderNodeID = member.NodeID
+			}
+		}
+
+		shardMsg.LeaderID = leaderNodeID
 
 		committeeMsg.Shards = append(committeeMsg.Shards, shardMsg)
 
@@ -183,9 +143,8 @@ func setNextRound() {
 		for _, m := range shardMsg.Member {
 			fmt.Printf("%s ", m.NodeID)
 		}
-		fmt.Println("]")
+		fmt.Println("] Leader: %s\n", shardMsg.LeaderID)
 	}
-
 	round_idx += 1
 	wp2p.CommitteeMessage(wp2p.Wctx, wp2p.Wtopic, committeeMsg)
 

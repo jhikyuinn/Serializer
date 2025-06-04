@@ -42,6 +42,8 @@ func JoinNetwork(ctx context.Context, ps *pubsub.PubSub, pubsubTopic string, top
 
 	if topicType == 1 {
 		go committeeHandler(ctx, sub)
+	} else if topicType == 2 {
+		go blockHandler(ctx, sub)
 	} else {
 		go pubsubHandler(ctx, sub)
 	}
@@ -106,6 +108,17 @@ func pubsubHandler(ctx context.Context, sub *pubsub.Subscription) {
 	}
 }
 
+func getOutboundIP() string {
+	// 임시로 UDP 연결 생성 → 실제 외부 IP 확인
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
 func committeeMessageHandler(id peer.ID, msg *SendMessage) {
 	json.Unmarshal(msg.Data, &CMsg)
 
@@ -113,9 +126,10 @@ func committeeMessageHandler(id peer.ID, msg *SendMessage) {
 	if CMsg.Type == 1 {
 		sndBuf, _ := json.Marshal(CMsg)
 		for {
-			conn, err := net.Dial("tcp", "localhost:4242")
+			selfIP := getOutboundIP()
+			conn, err := net.Dial("tcp", selfIP+":6262")
 			if err != nil {
-				// fmt.Println("Failed to Dial : ", err)
+				fmt.Println("Failed to Dial : ", err)
 				continue
 			}
 			defer conn.Close()
@@ -151,6 +165,56 @@ func committeeHandler(ctx context.Context, sub *pubsub.Subscription) {
 		switch *req.Type {
 		case Request_SEND_MESSAGE:
 			committeeMessageHandler(msg.GetFrom(), req.SendMessage)
+		}
+	}
+}
+
+func blockMessageHandler(id peer.ID, msg *SendMessage) {
+	json.Unmarshal(msg.Data, &CMsg)
+
+	// 📨📨 Recved CommitteeMsg including Type-1 Round Msg
+	if CMsg.Type == 2 {
+		sndBuf, _ := json.Marshal(CMsg)
+		for {
+			selfIP := getOutboundIP()
+			conn, err := net.Dial("tcp", selfIP+":5252")
+			if err != nil {
+				fmt.Println("Failed to Dial : ", err)
+				continue
+			}
+			defer conn.Close()
+			_, err = conn.Write(sndBuf)
+			if err != nil {
+				fmt.Println("Failed to write data : ", err)
+			}
+			err = conn.Close()
+			if err != nil {
+				fmt.Println("Failed to close : ", err)
+			}
+			break
+		}
+	}
+}
+
+func blockHandler(ctx context.Context, sub *pubsub.Subscription) {
+	defer sub.Cancel()
+	for {
+		msg, err := sub.Next(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			continue
+		}
+
+		req := &Request{}
+		err = proto.Unmarshal(msg.Data, req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			continue
+		}
+
+		switch *req.Type {
+		case Request_SEND_MESSAGE:
+			blockMessageHandler(msg.GetFrom(), req.SendMessage)
 		}
 	}
 }

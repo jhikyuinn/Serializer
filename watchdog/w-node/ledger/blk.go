@@ -14,7 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const addrDB = "mongodb://127.0.0.1:27017"
+const addrDB = "mongodb://localhost:27017"
 
 // func BlkInsert(cMsg *pb.AuditMsg) {
 // 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
