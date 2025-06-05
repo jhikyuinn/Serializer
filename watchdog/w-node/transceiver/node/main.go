@@ -32,7 +32,6 @@ import (
 	"github.com/BurntSushi/toml"
 	PuCtrl "github.com/MCNL-HGU/mp2btp/puctrl"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/google/uuid"
 	"github.com/herumi/bls-eth-go-binary/bls"
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/protoutil"
@@ -92,20 +91,20 @@ var (
 
 var MP2BTPsession *PuCtrl.PuCtrl
 
-func getKafkaGroupID() string {
-	hostname, _ := os.Hostname()
-	groupID := "myGroup-" + hostname
-	if groupID == "" {
-		// 환경변수가 없으면 임시 로컬용 UUID 생성
-		groupID = "local-" + uuid.New().String()
-		fmt.Println("KAFKA_GROUP_ID not set, using local generated ID:", groupID)
-	}
-	return groupID
-}
+// func getKafkaGroupID() string {
+// 	hostname, _ := os.Hostname()
+// 	groupID := "myGroup-" + hostname
+// 	if groupID == "" {
+// 		// 환경변수가 없으면 임시 로컬용 UUID 생성
+// 		groupID = "local-" + uuid.New().String()
+// 		fmt.Println("KAFKA_GROUP_ID not set, using local generated ID:", groupID)
+// 	}
+// 	return groupID
+// }
 
 func NewKafkaConsumer() *kafka.Consumer {
-	kafkaGroupID := getKafkaGroupID()
-	fmt.Println(kafkaGroupID)
+	// kafkaGroupID := getKafkaGroupID()
+	kafkaGroupID := "MYGROUP"
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
 		"bootstrap.servers": brokers,
 		"group.id":          kafkaGroupID,
@@ -228,9 +227,9 @@ func (w *CONSENSUSNODE) GetAddress() string {
 
 	for _, iface := range ifaces {
 		// 도커 컨테이너 환경일 경우
-		// if iface.Name == "eth0" {
-		// 로컬 환경일 경우
-		if iface.Name == "eno1" {
+		if iface.Name == "eth0" {
+			// 로컬 환경일 경우
+			// if iface.Name == "eno1" {
 			addrs, err := iface.Addrs()
 			if err != nil {
 				w.wlog.Printf("Failed to get addresses for interface %s: %v", iface.Name, err)
@@ -308,52 +307,54 @@ func (w *CONSENSUSNODE) KafkaListener(rekey string) {
 	re := regexp.MustCompile(`User(\d+)`)
 
 	for {
-
-		msg, err := c.ReadMessage(-1)
-		if err != nil {
-			log.Printf("Kafka read error: %v", err)
-			continue
-		}
-
-		if !w.isLeader.Load() {
-			log.Println("Not leader: received message ignored")
-			continue
-		}
-
-		// 메시지 처리 코드 ...
-		var Abortdata []*common.Envelope
-		err = json.Unmarshal(msg.Value, &Abortdata)
-		if err != nil {
-			log.Printf("Failed to unmarshal Kafka message: %v", err)
-			continue
-		}
-
-		userIDs := []int{}
-		for _, env := range Abortdata {
-			payload, err := protoutil.UnmarshalTransaction(env.Payload)
+		select {
+		case done := <-w.done:
+			fmt.Println(done, "❌", w.isLeader.Load())
+			if done && !w.isLeader.Load() {
+				c.Close()
+				return
+			}
+		default:
+			msg, err := c.ReadMessage(-1)
 			if err != nil {
-				log.Printf("Failed to unmarshal transaction payload: %v", err)
+				log.Printf("Kafka read error: %v", err)
 				continue
 			}
 
-			match := re.FindStringSubmatch(payload.String())
-			if len(match) > 1 {
-				idx := idxToInt(match[1])
-				userIDs = append(userIDs, idx)
+			var Abortdata []*common.Envelope
+			err = json.Unmarshal(msg.Value, &Abortdata)
+			if err != nil {
+				log.Printf("Failed to unmarshal Kafka message: %v", err)
+				continue
 			}
+
+			userIDs := []int{}
+			for _, env := range Abortdata {
+				payload, err := protoutil.UnmarshalTransaction(env.Payload)
+				if err != nil {
+					log.Printf("Failed to unmarshal transaction payload: %v", err)
+					continue
+				}
+
+				match := re.FindStringSubmatch(payload.String())
+				if len(match) > 1 {
+					idx := idxToInt(match[1])
+					userIDs = append(userIDs, idx)
+				}
+			}
+
+			userCount := make(map[string]int)
+			for _, id := range userIDs {
+				userKey := "User" + strconv.Itoa(id)
+				userCount[userKey]++
+			}
+
+			fmt.Println("User Count Map:", userCount)
+
+			w.auditMsg = &pb.AuditMsg{}
+			go w.bftConsensus(userCount)
+
 		}
-
-		userCount := make(map[string]int)
-		for _, id := range userIDs {
-			userKey := "User" + strconv.Itoa(id)
-			userCount[userKey]++
-		}
-
-		fmt.Println("User Count Map:", userCount)
-
-		w.auditMsg = &pb.AuditMsg{}
-		go w.bftConsensus(userCount)
-
 	}
 }
 
@@ -496,7 +497,7 @@ func (w *CONSENSUSNODE) BloConnHandler(conn net.Conn) {
 	fmt.Println("🏦 Received GossipMsg:", MsgRecv)
 
 	switch MsgRecv.GetType() {
-	case 1: // Leader/follower election message
+	case 1:
 		w.roundIdx = MsgRecv.RndMsg.RoundNum
 		isLeader := (MsgRecv.RndMsg.LeaderID == w.selfId)
 
@@ -506,15 +507,17 @@ func (w *CONSENSUSNODE) BloConnHandler(conn net.Conn) {
 		if isLeader {
 			fmt.Println("👑 Elected as leader")
 			go w.setDone(false)
-			go w.KafkaListener(MsgRecv.Channel + "-abort")
-			w.isLeader.Store(true)
+			go w.isLeader.Store(true)
+			go w.KafkaListener(w.channelID + "-abort")
+			fmt.Println(w.isLeader.Load())
 		} else {
 			fmt.Println("🧩 Follower consensus node")
 			go w.setDone(true)
-			w.isLeader.Store(false)
+			go w.isLeader.Store(false)
+			fmt.Println(w.isLeader.Load())
 		}
 
-	case 2: // Block commit message
+	case 2:
 		fmt.Println("📦 BLOCKINSERT: Committing block to ledger")
 		go lg.UserAbortInfoInsert(w.auditMsg)
 	}
@@ -576,12 +579,14 @@ func (w *CONSENSUSNODE) CommConnHandler(conn net.Conn) {
 				if isLeader {
 					fmt.Println("👑 Elected as leader")
 					go w.setDone(false)
+					go w.isLeader.Store(true)
 					go w.KafkaListener(w.channelID + "-abort")
-					w.isLeader.Store(true)
+					fmt.Println(w.isLeader.Load())
 				} else {
 					fmt.Println("🧩 Follower consensus node")
 					go w.setDone(true)
-					w.isLeader.Store(false)
+					go w.isLeader.Store(false)
+					fmt.Println(w.isLeader.Load())
 				}
 
 				return // exit after setting role
@@ -642,9 +647,9 @@ func (w *CONSENSUSNODE) submitPhase(ch chan<- bool, ip string, targetPhase pb.Au
 		rcvBuf := make([]byte, 8192)
 		n, err := stream.Read(rcvBuf)
 		if err != nil {
-			log.Printf("❌ Stream read error: %v", err)
+			// log.Printf("❌ Stream read error: %v", err)
 			ch <- false
-			return
+			break
 		}
 		if n == 0 {
 			continue
@@ -711,7 +716,8 @@ func (w *CONSENSUSNODE) StreamHandler(stream quic.Stream) {
 		rcvBuf := make([]byte, 8192)
 		n, err := stream.Read(rcvBuf)
 		if err != nil {
-			panic(err)
+			// log.Printf("❌ Stream read error: %v", err)
+			break
 		}
 
 		if n == 0 {
@@ -759,7 +765,6 @@ func (w *CONSENSUSNODE) commitPhase(cMsg *pb.AuditMsg) {
 }
 
 func (w *CONSENSUSNODE) sendResponse(stream quic.Stream) {
-	fmt.Println(w.auditMsg)
 	sndBuf, err := json.Marshal(w.auditMsg)
 	if err != nil {
 		panic(err)

@@ -32,7 +32,7 @@ WORKDIR /app
 
 # deps 스테이지에서 다운받은 모듈 복사
 COPY --from=deps /go/pkg /go/pkg
-COPY --from=deps /app/mp2btp-main ./mp2btp-main
+# COPY --from=deps /app/mp2btp-main ./mp2btp-main
 
 COPY go.mod go.sum ./
 

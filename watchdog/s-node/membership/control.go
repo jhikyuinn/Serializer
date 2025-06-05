@@ -148,7 +148,7 @@ func setNextRound() {
 	round_idx += 1
 	wp2p.CommitteeMessage(wp2p.Wctx, wp2p.Wtopic, committeeMsg)
 
-	setLatency(10)
+	setLatency(30)
 }
 
 func makeNodeUnique(s []*pb.Wnode) []*pb.Wnode {
