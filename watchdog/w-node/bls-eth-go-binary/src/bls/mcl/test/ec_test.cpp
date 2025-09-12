@@ -14,21 +14,73 @@
 typedef mcl::FpT<> Fp;
 struct tagZn;
 typedef mcl::FpT<tagZn> Zn;
-typedef mcl::EcT<Fp> Ec;
+typedef mcl::EcT<Fp, Zn> Ec;
 
 CYBOZU_TEST_AUTO(sizeof)
 {
-	CYBOZU_TEST_EQUAL(sizeof(Fp), sizeof(mcl::fp::Unit) * Fp::maxSize);
+	CYBOZU_TEST_EQUAL(sizeof(Fp), sizeof(mcl::Unit) * Fp::maxSize);
 	CYBOZU_TEST_EQUAL(sizeof(Ec), sizeof(Fp) * 3);
 }
 
+void naiveMulVec(Ec& out, const Ec *xVec, const Zn *yVec, size_t n)
+{
+	Ec r, t;
+	r.clear();
+	for (size_t i = 0; i < n; i++) {
+		Ec::mul(t, xVec[i], yVec[i]);
+		r += t;
+	}
+	out = r;
+}
+
+void mulVecTest(const mcl::EcParam& para, mcl::ec::Mode ecMode)
+{
+	if (ecMode != mcl::ec::Jacobi) return;
+	puts("mulVecTest");
+//	if (para.bitSize > 384) return;
+	cybozu::XorShift rg;
+	const Fp x(para.gx);
+	const Fp y(para.gy);
+	Ec P(x, y);
+	P += P;
+	const int N = 100;
+	Ec xVec[N];
+	Zn yVec[N];
+	Ec Q1, Q2;
+
+	Ec::dbl(P, P);
+	for (size_t i = 0; i < N; i++) {
+		Ec::mul(xVec[i], P, i + 3);
+		yVec[i].setByCSPRNG(rg);
+	}
+	const size_t nTbl[] = { 1, 2, 3, 5, 30, 31, 32, 33, N };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(nTbl); i++) {
+		const size_t n = nTbl[i];
+		CYBOZU_TEST_ASSERT(n <= N);
+		naiveMulVec(Q1, xVec, yVec, n);
+		Ec::mulVec(Q2, xVec, yVec, n);
+		CYBOZU_TEST_EQUAL(Q1, Q2);
+		Q2.clear();
+#ifdef NDEBUG
+		if (ecMode != mcl::ec::Jacobi) continue;
+		printf("n=%zd\n", n);
+		const int C = 5;//50;
+		CYBOZU_BENCH_C("naive ", C, naiveMulVec, Q1, xVec, yVec, n);
+		CYBOZU_BENCH_C("mulVec", C, Ec::mulVec, Q1, xVec, yVec, n);
+#endif
+	}
+}
+
+
 struct Test {
 	const mcl::EcParam& para;
+	mcl::ec::Mode ecMode;
 	Test(const mcl::EcParam& para, mcl::fp::Mode fpMode, mcl::ec::Mode ecMode)
 		: para(para)
+		, ecMode(ecMode)
 	{
 		printf("fpMode=%s\n", mcl::fp::ModeToStr(fpMode));
-		mcl::initCurve<Ec, Zn>(para.curveType, 0, fpMode, ecMode);
+		mcl::initCurve<Ec>(para.curveType, 0, fpMode, ecMode);
 	}
 	void cstr() const
 	{
@@ -53,7 +105,7 @@ struct Test {
 		Ec Q, R;
 		pow2(Q, P, n);
 		Q -= P; // Q = (2^n - 1)P
-		Fp x = 1;
+		Zn x = 1;
 		for (int i = 0; i < n; i++) {
 			x += x;
 		}
@@ -201,6 +253,64 @@ struct Test {
 			CYBOZU_TEST_EQUAL(R, R2);
 		}
 	}
+	void equalOrMinusTest() const
+	{
+		Fp x(para.gx);
+		Fp y(para.gy);
+		Ec P(x, y), Q, R;
+		Ec::mul(Q, P, 100); // Q = 100P
+		Ec::mul(R, P, 25);
+		R += R;
+		R += R; // R = 100P
+		if (Ec::getMode() != mcl::ec::Affine) {
+			CYBOZU_TEST_EQUAL(Q.x, R.x);
+		}
+		CYBOZU_TEST_EQUAL(Q.isEqualOrMinus(R), 1);
+		Ec::neg(R, R);
+		CYBOZU_TEST_EQUAL(Q.isEqualOrMinus(R), -1);
+		CYBOZU_TEST_EQUAL(P.isEqualOrMinus(R), 0);
+	}
+	void normalizeVecTest() const
+	{
+		if (Ec::getMode() == mcl::ec::Affine) return;
+		Fp x_(para.gx);
+		Fp y_(para.gy);
+		Ec P(x_, y_);
+		const size_t maxN = 10;
+		Ec x[maxN], y[maxN];
+		cybozu::XorShift rg;
+		for (size_t n = 0; n < maxN; n++) {
+			for (size_t j = 0; j < 10; j++) {
+				for (size_t i = 0; i < n; i++) {
+					Ec::dbl(y[i], P);
+					if ((j != 0 && (rg.get32() % 3) == 0) || j == 1) {
+						if ((i % 2) == 0) {
+							x[i].clear();
+						} else {
+							Ec::normalize(x[i], P);
+						}
+					} else {
+						Zn r;
+						r.setByCSPRNG(rg);
+						Ec::mul(x[i], P, r);
+					}
+					y[i] = P;
+				}
+				Ec::normalizeVec(y, x, n);
+				for (size_t i = 0; i < n; i++) {
+					if (x[i].isZero()) {
+						CYBOZU_TEST_ASSERT(y[i].isZero());
+					} else {
+						Ec t;
+						Ec::normalize(t, x[i]);
+						CYBOZU_TEST_EQUAL(y[i], t);
+					}
+				}
+				Ec::normalizeVec(x, x, n); // same addr
+				CYBOZU_TEST_EQUAL_ARRAY(y, x, n);
+			}
+		}
+	}
 
 	void mul() const
 	{
@@ -275,19 +385,37 @@ struct Test {
 	}
 	void squareRoot() const
 	{
+		Ec P(Fp(para.gx), Fp(para.gy));
+
+		for (int i = 0; i < 100; i++) {
+			Ec::dbl(P, P);
+			P.normalize();
+			Fp x = P.x;
+			Fp y = P.y;
+			Fp yy;
+			CYBOZU_TEST_ASSERT(Ec::getYfromX(yy, x, y.isOdd()));
+			CYBOZU_TEST_EQUAL(yy, y);
+			Fp::neg(y, y);
+			yy.clear();
+			CYBOZU_TEST_ASSERT(Ec::getYfromX(yy, x, y.isOdd()));
+			CYBOZU_TEST_EQUAL(yy, y);
+			yy += P.y;
+			CYBOZU_TEST_ASSERT(yy.isZero());
+		}
+
 		Fp x(para.gx);
-		Fp y(para.gy);
-		bool odd = y.isOdd();
-		Fp yy;
-		bool b = Ec::getYfromX(yy, x, odd);
-		CYBOZU_TEST_ASSERT(b);
-		CYBOZU_TEST_EQUAL(yy, y);
-		Fp::neg(y, y);
-		odd = y.isOdd();
-		yy.clear();
-		b = Ec::getYfromX(yy, x, odd);
-		CYBOZU_TEST_ASSERT(b);
-		CYBOZU_TEST_EQUAL(yy, y);
+		for (int i = 0; i < 100; i++) {
+			mpz_class mx = x.getMpz();
+			int ret = mcl::gmp::legendre(mx, Fp::getOp().mp);
+			Fp y;
+			if (Fp::squareRoot(y, x)) {
+				CYBOZU_TEST_EQUAL(y*y, x);
+				CYBOZU_TEST_EQUAL(ret, 1);
+			} else {
+				CYBOZU_TEST_EQUAL(ret, -1);
+			}
+			x += 1;
+		}
 	}
 	void mul_fp() const
 	{
@@ -383,6 +511,7 @@ struct Test {
 		{
 			std::string s = P.getStr(mcl::IoSerialize);
 			CYBOZU_TEST_EQUAL(s.size(), Fp::getByteSize() + adj);
+			CYBOZU_TEST_EQUAL(s.size(), Ec::getSerializedByteSize());
 			Q.setStr(s, mcl::IoSerialize);
 			CYBOZU_TEST_EQUAL(P, Q);
 		}
@@ -409,7 +538,7 @@ struct Test {
 		{
 			std::string s = P.getStr(mcl::IoSerialize);
 			CYBOZU_TEST_EQUAL(s.size(), Fp::getByteSize() + adj);
-			CYBOZU_TEST_ASSERT(mcl::fp::isZeroArray(s.c_str(), s.size()));
+			CYBOZU_TEST_ASSERT(mcl::bint::isZeroN(s.c_str(), s.size()));
 			Q.setStr(s, mcl::IoSerialize);
 			CYBOZU_TEST_EQUAL(P, Q);
 		}
@@ -515,6 +644,42 @@ struct Test {
 		mcl::ec::addCTProj(Q, Zero, Zero);
 		Ec::add(R, Zero, Zero);
 		CYBOZU_TEST_EQUAL(Q, R);
+		mcl::ec::addCTProj(Q, Q, Q);
+		Ec::add(R, R, R);
+		CYBOZU_TEST_EQUAL(Q, R);
+
+		// dbl
+		mcl::ec::dblCTProj(P, Q);
+		Ec::dbl(R, R);
+		CYBOZU_TEST_EQUAL(Q, R);
+		mcl::ec::dblCTProj(Q, Q);
+		Ec::dbl(R, R);
+		CYBOZU_TEST_EQUAL(Q, R);
+		mcl::ec::dblCTProj(Q, Zero);
+		CYBOZU_TEST_EQUAL(Q, Zero);
+	}
+	void ProjJacobi() const
+	{
+		if (Ec::getMode() == mcl::ec::Affine) return;
+		Fp x(para.gx);
+		Fp y(para.gy);
+		Ec P(x, y), Q, R;
+		P *= 123;
+		if (Ec::getMode() == mcl::ec::Proj) {
+			mcl::ec::ProjToJacobi(Q, P);
+			mcl::ec::normalizeJacobi(Q);
+			CYBOZU_TEST_EQUAL(Q, P);
+			mcl::ec::ProjToJacobi(Q, P);
+			mcl::ec::JacobiToProj(R, Q);
+			CYBOZU_TEST_EQUAL(R, P);
+		} else {
+			mcl::ec::JacobiToProj(Q, P);
+			mcl::ec::normalizeProj(Q);
+			CYBOZU_TEST_EQUAL(Q, P);
+			mcl::ec::JacobiToProj(Q, P);
+			mcl::ec::ProjToJacobi(R, Q);
+			CYBOZU_TEST_EQUAL(R, P);
+		}
 	}
 
 	template<class F>
@@ -546,6 +711,9 @@ mul 499.00usec
 */
 	void run() const
 	{
+		mulVecTest(para, ecMode);
+		equalOrMinusTest();
+		normalizeVecTest();
 		cstr();
 		ope();
 		mul();
@@ -558,56 +726,12 @@ mul 499.00usec
 		mulCT();
 		compare();
 		addCT();
+		ProjJacobi();
 	}
 private:
 	Test(const Test&);
 	void operator=(const Test&);
 };
-
-void naiveMulVec(Ec& out, const Ec *xVec, const Zn *yVec, size_t n)
-{
-	Ec r, t;
-	r.clear();
-	for (size_t i = 0; i < n; i++) {
-		Ec::mul(t, xVec[i], yVec[i]);
-		r += t;
-	}
-	out = r;
-}
-
-void mulVec(const mcl::EcParam& para)
-{
-	if (para.bitSize > 384) return;
-	cybozu::XorShift rg;
-	const Fp x(para.gx);
-	const Fp y(para.gy);
-	Ec P(x, y);
-	P += P;
-	const int N = 33;
-	Ec xVec[N];
-	Zn yVec[N];
-	Ec Q1, Q2;
-
-	Ec::dbl(P, P);
-	for (size_t i = 0; i < N; i++) {
-		Ec::mul(xVec[i], P, i + 3);
-		yVec[i].setByCSPRNG(rg);
-	}
-	const size_t nTbl[] = { 1, 2, 3, 5, 30, 31, 32, 33 };
-	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(nTbl); i++) {
-		const size_t n = nTbl[i];
-		CYBOZU_TEST_ASSERT(n <= N);
-		naiveMulVec(Q1, xVec, yVec, n);
-		Ec::mulVec(Q2, xVec, yVec, n);
-		CYBOZU_TEST_EQUAL(Q1, Q2);
-#ifdef NDEBUG
-		printf("n=%zd\n", n);
-		const int C = 50;
-		CYBOZU_BENCH_C("naive ", C, naiveMulVec, Q1, xVec, yVec, n);
-		CYBOZU_BENCH_C("mulVec", C, Ec::mulVec, Q1, xVec, yVec, n);
-#endif
-	}
-}
 
 void test_sub_sub(const mcl::EcParam& para, mcl::fp::Mode fpMode)
 {
@@ -631,7 +755,6 @@ void test_sub(const mcl::EcParam *para, size_t paraNum)
 #ifdef MCL_X64_ASM
 		test_sub_sub(para[i], mcl::fp::FP_XBYAK);
 #endif
-		mulVec(para[i]);
 	}
 }
 

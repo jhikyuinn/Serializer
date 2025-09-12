@@ -68,12 +68,12 @@ func GetFpByteSize() int {
 
 // GetG1ByteSize -- the serialized size of G1
 func GetG1ByteSize() int {
-	return GetFpByteSize()
+	return int(C.mclBn_getG1ByteSize())
 }
 
 // GetG2ByteSize -- the serialized size of G2
 func GetG2ByteSize() int {
-	return GetFpByteSize() * 2
+	return int(C.mclBn_getG2ByteSize())
 }
 
 // allow zero length byte
@@ -140,6 +140,26 @@ func SetMapToMode(mode int) error {
 	err := C.mclBn_setMapToMode((C.int)(mode))
 	if err != 0 {
 		return fmt.Errorf("SetMapToMode mode=%d\n", mode)
+	}
+	return nil
+}
+
+// SetDstG1 --
+func SetDstG1(s string) error {
+	// #nosec
+	err := C.mclBnG1_setDst((*C.char)(getPointer([]byte(s))), C.size_t(len(s)))
+	if err != 0 {
+		return fmt.Errorf("err mclBnG1_setDst")
+	}
+	return nil
+}
+
+// SetDstG2 --
+func SetDstG2(s string) error {
+	// #nosec
+	err := C.mclBnG2_setDst((*C.char)(getPointer([]byte(s))), C.size_t(len(s)))
+	if err != 0 {
+		return fmt.Errorf("err mclBnG2_setDst")
 	}
 	return nil
 }

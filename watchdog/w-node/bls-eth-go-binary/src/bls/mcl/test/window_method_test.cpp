@@ -4,35 +4,14 @@
 #include <mcl/fp.hpp>
 #include <mcl/ecparam.hpp>
 
-CYBOZU_TEST_AUTO(ArrayIterator)
-{
-	const uint32_t in[] = { 0x12345678, 0xabcdef89, 0xaabbccdd };
-	for (size_t bitSize = 1; bitSize <= 64; bitSize++) {
-		for (size_t w = 1; w <= 32; w++) {
-
-			const uint32_t mask = uint32_t((uint64_t(1) << w) - 1);
-			mpz_class x;
-			mcl::gmp::setArray(x, in, CYBOZU_NUM_OF_ARRAY(in));
-			x &= (mpz_class(1) << bitSize) - 1;
-			mcl::fp::ArrayIterator<uint32_t> ai(in, bitSize, w);
-			size_t n = (bitSize + w - 1) / w;
-			for (size_t j = 0; j < n; j++) {
-				CYBOZU_TEST_ASSERT(ai.hasNext());
-				uint32_t v = ai.getNext();
-				CYBOZU_TEST_EQUAL(x & mask, v);
-				x >>= w;
-			}
-			CYBOZU_TEST_ASSERT(!ai.hasNext());
-		}
-	}
-}
-
 CYBOZU_TEST_AUTO(int)
 {
 	typedef mcl::FpT<> Fp;
-	typedef mcl::EcT<Fp> Ec;
+	typedef mcl::FpT<mcl::ZnTag> Fr;
+	typedef mcl::EcT<Fp, Fr> Ec;
 	const struct mcl::EcParam& para = mcl::ecparam::secp192k1;
 	Fp::init(para.p);
+	Fr::init(para.n);
 	Ec::init(para.a, para.b);
 	const Fp x(para.gx);
 	const Fp y(para.gy);
@@ -55,6 +34,8 @@ CYBOZU_TEST_AUTO(int)
 	Ec::mul(R, P, -12345);
 	CYBOZU_TEST_EQUAL(Q, R);
 	mpz_class t(para.gx);
+	Fr r;
+	r.setMpz(t);
 	pw.mul(Q, t);
 	Ec::mul(R, P, t);
 	CYBOZU_TEST_EQUAL(Q, R);
@@ -63,11 +44,11 @@ CYBOZU_TEST_AUTO(int)
 	Ec::mul(R, P, t);
 	CYBOZU_TEST_EQUAL(Q, R);
 
-	pw.mul(Q, x);
-	Ec::mul(R, P, x);
+	pw.mul(Q, r);
+	Ec::mul(R, P, r);
 	CYBOZU_TEST_EQUAL(Q, R);
 
-	pw.mul(Q, y);
-	Ec::mul(R, P, y);
+	pw.mul(Q, r);
+	Ec::mul(R, P, r);
 	CYBOZU_TEST_EQUAL(Q, R);
 }

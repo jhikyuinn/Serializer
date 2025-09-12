@@ -15,16 +15,6 @@ import (
 	//equic "github.com/MCNL-HGU/Enhanced-quic"
 )
 
-func isUDPPortOpen(addr string) bool {
-	conn, err := net.ListenPacket("udp", addr)
-	if err != nil {
-		// 포트가 이미 사용 중이면 false
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
 // PuCtrlListen() function manages PuCtrlConnection and prepares to receive data.
 func Listener(chStopListen <-chan bool) {
 
@@ -34,13 +24,6 @@ func Listener(chStopListen <-chan bool) {
 	buf := make([]byte, 5)
 
 	myAddr := fmt.Sprintf("%s:%d", Conf.MY_IP_ADDRS[0], Conf.LISTEN_PORT)
-	fmt.Println("🚨🚨🚨🚨🚨🚨🚨🚨🚨", myAddr)
-
-	if !isUDPPortOpen(myAddr) {
-		fmt.Printf("❌ Port already in use: %s. Listener aborted.\n", myAddr)
-		return
-	}
-
 	listener, err := quic.ListenAddr(myAddr, tlsConfig, nil)
 	if err != nil {
 		panic(err)
@@ -92,19 +75,21 @@ func Connector(src string, dst string, sessionType byte) *PuSession {
 	// Bind source IP (my IP)
 	srcAddr, err := net.ResolveUDPAddr("udp", src)
 	if err != nil {
-		panic(err)
+		return nil
 	}
 
 	// Bind destination IP
 	dstAddr, err := net.ResolveUDPAddr("udp", dst)
 	if err != nil {
-		panic(err)
+		fmt.Println("SLOw2")
+		return nil
 	}
 
 	// Create UDP connection
 	udpConn, err := net.ListenUDP("udp", srcAddr)
 	if err != nil {
-		panic(err)
+		fmt.Println("SLOw3")
+		return nil
 	}
 
 	// TLS Configuration for Connector
@@ -118,13 +103,14 @@ func Connector(src string, dst string, sessionType byte) *PuSession {
 	// Connect
 	conn, err := quic.Dial(context.Background(), udpConn, dstAddr, tlsConf, nil)
 	if err != nil {
-		panic(err)
+		fmt.Println("SLOw4")
+		return nil
 	}
 
 	// Get stream
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		panic(err)
+		fmt.Println("SLOw5")
 	}
 
 	// Convert session type and ID to byte slice
@@ -160,6 +146,7 @@ type PuSession struct {
 	sessionID   uint32
 	index       uint16
 	stream      quic.Stream
+	conn        quic.Connection
 	puCtrl      *PuCtrl
 	blockNumber uint32
 	blockStatus uint32
@@ -190,8 +177,9 @@ func (s *PuSession) handler() {
 		pkt := make([]byte, packet.PACKET_SIZE)
 		_, err := s.readWithSize(pkt, 3)
 		if err != nil {
-			panic(err)
+			continue
 		}
+		fmt.Println(pkt[:3])
 		r := bytes.NewReader(pkt[:3])
 		pktType, _ := r.ReadByte()
 		pktLength, _ := util.ReadUint16(r)
@@ -202,9 +190,23 @@ func (s *PuSession) handler() {
 		// util.Log("PuSession[%d].handler(): Packet Type=%d, Length=%d", s.sessionID, pktType, pktLength)
 
 		// Read remaining packet data
-		_, err = s.readWithSize(pkt[3:pktLength], int(pktLength-3)) // Read after field of packet length
-		if err != nil {
-			panic(err)
+		if pktType == 21 {
+			_, err = s.readWithSize(pkt[3:pktLength+7], int(pktLength+4)) // Read after field of packet length
+			if err != nil {
+				panic(err)
+			}
+
+		} else if pktType == 22 {
+			_, err = s.readWithSize(pkt[3:pktLength+7], int(pktLength+4)) // Read after field of packet length
+			if err != nil {
+				panic(err)
+			}
+		} else {
+			_, err = s.readWithSize(pkt[3:pktLength], int(pktLength-3)) // Read after field of packet length
+			if err != nil {
+				panic(err)
+			}
+
 		}
 
 		// Parse packet
@@ -286,34 +288,19 @@ func (s *PuSession) parsePacket(pktType byte, data []byte) {
 		}
 		s.handlePathInfoAckPacket(pkt)
 
-	// // Block Data ACK Packet
-	// case pc.BLOCK_DATA_ACK_PACKET:
-	// 	packet, err := pc.ParseBlockDataAckPacket(r)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	s.handleBlockDataAckPacket(packet)
-	// // Block FIN Packet
-	// case pc.BLOCK_FIN_PACKET:
-	// 	packet, err := pc.ParseBlockFinPacket(r)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	s.handleBlockFinPacket(packet, sessionID)
-	// // Control Packet
-	// case pc.CONTROL_PACKET:
-	// 	packet, err := pc.ParseControlPacket(r)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	s.handleControlPacket(packet)
-	// Node Info ACK Packet
-	// case pc.NODE_INFO_ACK_PACKET:
-	// 	packet, err := pc.ParseNodeInfoAckPacket(r)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	s.handleNodeInfoAckPacket(packet, sessionID)
+	case packet.AUDIT_MSG_PACKET:
+		pkt, err := packet.ParseAuditDataPacket(r)
+		if err != nil {
+			panic(err)
+		}
+		s.handleAuditMsgPacket(pkt)
+	case packet.AUDIT_MSG_ACK_PACKET:
+		pkt, err := packet.ParseAuditDataAckPacket(r)
+		if err != nil {
+			panic(err)
+		}
+		s.handleAuditMsgAckPacket(pkt)
+
 	default:
 		panic(fmt.Sprintf("PuSession[%d].handler(): Unknown packet type (%d)", s.sessionID, pktType))
 	}
@@ -324,6 +311,7 @@ func (s *PuSession) parsePacket(pktType byte, data []byte) {
 func (s *PuSession) handleNodeInfoPacket(pkt *packet.NodeInfoPacket) {
 	util.Log("PuSession[%d].handleNodeInfoPacket(): NumberOfnodes=%d", s.sessionID, len(pkt.NodeInfos))
 
+	fmt.Println("👉🏻", pkt.NodeInfos)
 	// Connect to Child nodes
 	s.puCtrl.Connect(pkt.NodeInfos, byte(pkt.SessionType))
 }
@@ -377,6 +365,22 @@ func (s *PuSession) handlePathInfoAckPacket(pkt *packet.PathInfoPacket) {
 	}
 }
 
+// Handle a Audit MSG Packet
+func (s *PuSession) handleAuditMsgPacket(pkt *packet.AuditDataPacket) {
+	util.Log("PuSession[%d].handleAuditMsgPacket()", s.sessionID)
+
+	s.puCtrl.ReceiveAuditMsg(s.sessionID, pkt)
+
+}
+
+// Handle a Audit MSG Ack Packet
+func (s *PuSession) handleAuditMsgAckPacket(pkt *packet.AuditDataAckPacket) {
+	util.Log("PuSession[%d].handleAuditMsgAckPacket()", s.sessionID)
+
+	s.puCtrl.ReceiveAuditMsgAck(s.sessionID, pkt)
+
+}
+
 // Handle a Block Find Packet
 func (s *PuSession) handleBlockFindPacket(pkt *packet.BlockFindPacket) {
 	util.Log("PuSession[%d].handleBlockFindPacket(): BlockNumber=%d", s.sessionID, pkt.BlockNumber)
@@ -422,19 +426,6 @@ func (s *PuSession) handleBlockDataPacket(pkt *packet.BlockDataPacket) {
 		util.Log("PuSession[%d].handleBlockDataPacket(): Block does not exsit! BlockNumber=%d", s.sessionID, pkt.BlockNumber)
 	}
 }
-
-// Send a Block Data ACK Packet
-// func (s *PuSession) sendBlockDataAckPacket(sessionID uint32, blockNumber uint32, lastDataNumber uint32) {
-
-// 	pkt := packet.CreateBlockDataAckPacket(blockNumber, lastDataNumber)
-// 	util.Log("Mp2Session.sendBlockDataAckPacket(): SessionID=%d, BlockNumber=%d, lastDataNumber=%d", sessionID, blockNumber, lastDataNumber)
-
-// 	b := &bytes.Buffer{}
-// 	pkt.Write(b)
-
-// 	// Send bytes of packet
-// 	s.sendPacket(b.Bytes())
-// }
 
 // Send a Node Info Packet (Node Info includes primary path only)
 func (s *PuSession) sendNodeInfoPacket(nodeInfos []packet.NodeInfo) {
@@ -527,44 +518,29 @@ func (s *PuSession) sendBlockDataPacket(blockNumber uint32, dataNumber uint32, d
 	s.sendPacket(b.Bytes())
 }
 
-// // Send a Block FIN Packet
-// func (s *PuSession) sendBlockFinPacket(sessionID uint32) {
+func (s *PuSession) sendAuditDataPacket(data []byte) {
 
-// 	packet := pc.CreateBlockFinPacket(sessionID, s.blockNumber)
-// 	util.Log("Mp2Session.sendBlockFinPacket(): SessionID=%d, BlockNumber=%d", sessionID, s.blockNumber)
+	pkt := packet.CreateAuditDataPacket(s.sessionID, data)
+	// util.Log("PuSession[%d].sendBlockDataPacket(): BlockNumber=%d, DataNumber=%d, Length of data=%d", s.sessionID, blockNumber, dataNumber, len(data))
 
-// 	b := &bytes.Buffer{}
-// 	packet.Write(b)
+	b := &bytes.Buffer{}
+	pkt.Write(b)
 
-// 	// Send bytes of packet
-// 	s.sendPacket(sessionID, b.Bytes(), packet.Type)
-// }
+	// Send bytes of packet
+	s.sendPacket(b.Bytes())
+}
 
-// // Send a Control Packet
-// func (s *PuSession) sendControlPacket(sessionID uint32, data []byte) {
+func (s *PuSession) sendAuditDataAckPacket(data []byte) {
 
-// 	packet := pc.CreateControlPacket(data)
-// 	util.Log("Mp2Session.sendControlPacket(): SessionID=%d, Length of data=%d", sessionID, len(data))
+	pkt := packet.CreateAuditDataAckPacket(s.sessionID, data)
+	// util.Log("PuSession[%d].sendBlockDataPacket(): BlockNumber=%d, DataNumber=%d, Length of data=%d", s.sessionID, blockNumber, dataNumber, len(data))
 
-// 	b := &bytes.Buffer{}
-// 	packet.Write(b)
+	b := &bytes.Buffer{}
+	pkt.Write(b)
 
-// 	// Send bytes of packet
-// 	s.sendPacket(sessionID, b.Bytes(), packet.Type)
-// }
-
-// // Send a Node Info ACK Packet
-// func (s *PuSession) sendNodeInfoAckPacket(sessionID uint32, numOfInfo uint16) {
-
-// 	packet := pc.CreateNodeInfoAckPacket(numOfInfo)
-// 	util.Log("Mp2Session.sendNodeInfoAckPacket(): SessionID=%d, Number of nodes=%d", sessionID, numOfInfo)
-
-// 	b := &bytes.Buffer{}
-// 	packet.Write(b)
-
-// 	// Send bytes of packet
-// 	s.sendPacket(sessionID, b.Bytes(), packet.Type)
-// }
+	// Send bytes of packet
+	s.sendPacket(b.Bytes())
+}
 
 // Send a packet
 func (s *PuSession) sendPacket(buf []byte) {
@@ -575,115 +551,15 @@ func (s *PuSession) sendPacket(buf []byte) {
 	}
 }
 
-// // Read a Control Packet
-// func (s *PuSession) ReadControl(buf []byte) int {
-// 	// TODO: infinite-loop
-// 	for len(s.controlRecvBuffer) == 0 && !s.goodbye {
-// 	}
+// TODO: not only stream close, but also session close
+func (s *PuSession) Close() {
+	fmt.Printf("🔻 Closing session %d\n", s.sessionID)
 
-// 	readLen := 0
+	if s.stream != nil {
+		_ = s.stream.Close()
+	}
 
-// 	if len(s.controlRecvBuffer) > 0 {
-// 		s.mutexControl.Lock()
-// 		// Copy packet data to buf
-// 		packet := s.controlRecvBuffer[0]
-// 		copy(buf, packet.Data)
-// 		readLen = len(packet.Data)
-
-// 		// Remove first packet in control receive buffer
-// 		s.controlRecvBuffer = s.controlRecvBuffer[1:]
-// 		s.mutexControl.Unlock()
-// 	}
-
-// 	return readLen
-// }
-
-// // Write a Control Packet
-// func (s *PuSession) WriteControl(buf []byte) {
-
-// 	offset := uint32(0)
-// 	buf_len := uint32(len(buf))
-// 	sessionID := uint32(0)
-
-// 	// TODO: handling session ID for Write()
-// 	for offset < buf_len {
-// 		size := uint32(0)
-// 		if offset+uint32(pc.PAYLOAD_SIZE) <= buf_len {
-// 			size = uint32(pc.PAYLOAD_SIZE)
-// 		} else {
-// 			size = (uint32(len(buf)) - offset)
-// 		}
-
-// 		data := make([]byte, size)
-// 		copy(data, buf[offset:offset+size])
-
-// 		// Send a Control Packet
-// 		for sessionID = range s.sessionMap {
-// 			s.sendControlPacket(sessionID, data)
-// 		}
-
-// 		offset += size
-// 	}
-// }
-
-// // TODO: not only stream close, but also session close
-// func (s *PuSession) Close() {
-// 	for _, session := range s.sessionMap {
-// 		session.Close()
-// 	}
-// }
-
-// func (s *PuSession) timer() {
-// 	firstTimeout := true
-// 	s.mp2SessionManager.mutexForTimeout.Lock()
-// 	s.mp2SessionManager.timeoutFlag[s.blockNumber] = false
-// 	s.mp2SessionManager.mutexForTimeout.Unlock()
-
-// timer:
-// 	for {
-// 		select {
-// 		case <-s.noTimeoutChan:
-// 			s.mp2SessionManager.mutexForTimeout.Lock()
-// 			s.mp2SessionManager.timeoutFlag[s.blockNumber] = false
-// 			s.mp2SessionManager.mutexForTimeout.Unlock()
-// 		case <-time.After(TIMEOUT * time.Second):
-// 			blockBuffer := s.mp2SessionManager.recvBuffer[s.blockNumber]
-
-// 			util.Log("Mp2Session.timer(): Timeout!! ReadBytes=%d, LastRecvBytes=%d",
-// 				blockBuffer.readBytes, blockBuffer.lastRecvBytes)
-
-// 			if blockBuffer.lastRecvBytes == s.mp2SessionManager.blockList[s.blockNumber] {
-
-// 				s.mp2SessionManager.blockFinishFlag[s.key] <- true
-
-// 				for sessionID := range s.sessionMap {
-// 					// Send a Block FIN Packet to sender side
-// 					s.sendBlockFinPacket(sessionID)
-// 				}
-
-// 				break timer
-// 			}
-
-// 			// FIXME: not clear
-// 			if firstTimeout {
-// 				firstTimeout = false
-
-// 				// Wait until all received bytes are read
-// 				for blockBuffer.readBytes < blockBuffer.lastRecvBytes {
-// 				}
-
-// 				// Flush segment list
-// 				s.mp2SessionManager.recvBuffer[s.blockNumber].buffer = nil
-
-// 				// Timeout flag
-// 				s.mp2SessionManager.mutexForTimeout.Lock()
-// 				s.mp2SessionManager.timeoutFlag[s.blockNumber] = true
-// 				s.mp2SessionManager.mutexForTimeout.Unlock()
-
-// 				// Connect for PULL mode
-// 				s.mp2SessionManager.Mp2ConnectForPull(s.blockNumber)
-// 			}
-
-// 		}
-// 	}
-// }
+	if s.conn != nil {
+		_ = s.conn.CloseWithError(0, "Session closed")
+	}
+}

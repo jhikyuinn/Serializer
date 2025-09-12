@@ -20,6 +20,7 @@ import (
 
 /* Propagate Msg/Blk to all w-nodes in WDN ------------------------------------------------------------------------------------*/
 func WDNMessage(ctx context.Context, topic *pubsub.Topic, data *pb.GossipMsg) {
+
 	msg, err := json.Marshal(data)
 	if err != nil {
 		panic(err)
@@ -39,8 +40,7 @@ func WDNMessage(ctx context.Context, topic *pubsub.Topic, data *pb.GossipMsg) {
 	req := &Request{
 		Type: Request_SEND_MESSAGE.Enum(),
 		SendMessage: &SendMessage{
-			Id: msgId,
-			//Data:    []byte(msg),
+			Id:      msgId,
 			Data:    msg,
 			Created: &now,
 		},

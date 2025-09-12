@@ -6,10 +6,14 @@ This library is an implementation of BLS threshold signature,
 which supports the new BLS Signatures specified at [Ethereum 2.0 Phase 0](https://github.com/ethereum/eth2.0-specs/blob/dev/specs/phase0/beacon-chain.md#bls-signatures).
 
 ## News
+- 2024/Oct/23 Add a sample for Zig (See ffi/zig/).
+- 2023/Aug/17 The performance of Sign is improved.
+- 2022/Apr/20 The performance of MulVec got 2x speed for n >= 256, but const attribute of some arguments of MulVec and MultiVerify is removed.
+  - They may be normalized in processing but the value are not changed.
 - 2021/Sep/16 update mcl and improve performance of isValidOrder, which is called from setStr/deserialize.
 - 2021/Apr/28 add blsSetGeneratorOfPublicKey to change the generator.
 - 2021/Jan/28 check zero public key on BLS_ETH mode
-- 2020/Oct/07 add `blsMultiVerify` to process many verification all togather with multi thread.
+- 2020/Oct/07 add `blsMultiVerify` to process many verification all together with multi thread.
 
 ## Support architectures
 
@@ -37,6 +41,21 @@ ETH2.0 spec (BLS_ETH=1)|Fr|G1|G2|
 
 If you need ETH2.0 spec, then use this library with `BLS_ETH=1` mode.
 
+## Interoperability of BLS signature on BLS12-381 pairing
+
+If you want to use the same parameters as Ethereum 2.0, just define `BLS_ETH`.
+If you want to use mcl/bls without `BLS_ETH`, then check the following settings.
+- Serialization/Deserialization between Fr/G1/G2 and byte sequences.
+  - call `blsSetETHserialization(1);` to use the same specification as ETH2.0.
+  - `Serialize()` compresses a point of G1/G2.
+- The generator of G1/G2.
+  - call `blsPublicKeySetHexStr`.
+- Hash function from arbitrary byte sequences to G1/G2.
+  - call `blsSetMapToMode(MCL_MAP_TO_MODE_HASH_TO_CURVE);` to use the same specification as ETH2.0.
+  - call `mclBnG1_setDst` to set up domain separation.
+
+For example, see [initForDFINITY](https://github.com/herumi/bls/blob/master/sample/dfinity.c#L11) for DFINITY compatibility.
+
 ## Support language bindings
 
 language|ETH2.0 spec (PublicKey = G1)|default (PublicKey = G2)|
@@ -48,7 +67,7 @@ Rust|[bls-eth-rust](https://github.com/herumi/bls-eth-rust)|-|
 ## Compiled static library with `BLS_ETH=1`
 
 The compiled static libraries with `BLS_ETH=1` mode for {windows, darwin}/amd64, linux/{amd64, arm64} and android/{arm64-v8a, armeabi-v7a}
-are provided at [bls-eth-go-binary/bls/lib](https://github.com/herumi/bls-eth-go-binary/tree/master/bls/lib).
+are provided at [bls-eth-go-binary/bls/lib](https://github.com/herumi/bls-eth-go-binary/tree/release/bls/lib).
 
 ## Basic C API
 
@@ -255,7 +274,7 @@ void blsMultiAggregatePublicKey(
 ```
 Set `aggPub = sum_{i=0^n-1} pubVec[i] t_i, where (t_1, ..., t_n) = Hash({pubVec[0..n-1]})`.
 
-## How to build a static library by ownself
+## How to build a static library by oneself
 
 The following description is for `BLS_ETH=1` mode.
 Remove it if you need PublicKey as G1.
@@ -274,11 +293,21 @@ make BLS_ETH=1 lib/libbls384_256.a
 ```
 If the option `MCL_USE_GMP=0` (resp.`MCL_USE_OPENSSL=0`) is used then GMP (resp. OpenSSL) is not used.
 
-### Build static library for Windows
+### Build library for Windows
+Open the x64 Native Tools for Visual Studio and type the following command.
 
+static library
 ```
 mklib eth
 ```
+
+dynamic library
+```
+mklib dll eth
+```
+
+Or open `bls.sln` and build it.
+*REMARK* CmakeLists.txt is not maintained for Visual Studio.
 
 ### Build static library for Android
 

@@ -1,0 +1,71 @@
+# MP2BTP Configurations 
+
+# Verbose mode for Puctrl 
+VERBOSE_MODE        = true
+
+# Network address
+NUM_MULTIPATH       = 1
+MY_IP_ADDRS         = ["203.252.112.31", "192.168.10.2"]  # First IP is a primary path 
+LISTEN_PORT         = 4000
+BIND_PORT           = 5000
+
+# Enhanced QUIC
+EQUIC_ENABLE        = true
+EQUIC_PATH          = "../../mulctrl/fectun"
+EQUIC_APP_SRC_PORT  = 6000
+EQUIC_APP_DST_PORT  = 5000
+EQUIC_TUN_SRC_PORT  = 7000
+EQUIC_TUN_DST_PORT  = 7000
+EQUIC_FEC_MODE      = false
+
+# SEGMENT SIZE
+SEGMENT_SIZE        = 2097152  
+FEC_SEGMENT_SIZE    = 2466816  
+PULL_MODE           = 0
+
+# Others - to be updated 
+THROUGHPUT_PERIOD = 0.1 # sec
+THROUGHPUT_WEIGHT = 0.1 # 0 ~ 1.0
+MULTIPATH_THRESHOLD_THROUGHPUT = 100.0 # Mbps
+MULTIPATH_THRESHOLD_SEND_COMPLETE_TIME = 0.0000000001 # sec 
+CLOSE_TIMEOUT_PERIOD = 200 # ms
+MAX_CONNECTION_RETRY = 5
+PUSH_PULL_TRANSITION_TIMEOUT = 500 # ms
+
+# Must be located in the last part of file (why??)
+# PEER_ADDRS
+[[peer_addr]]  # A / Offset=0
+Addr        = "203.252.112.31"
+NumChild    = 2 # 1
+ChildOffset = 1
+
+[[peer_addr]]  # B / Offset=1
+Addr        = "203.252.112.32"
+NumChild    = 1 # 1
+ChildOffset = 3
+
+[[peer_addr]]  # C / Offset=2
+Addr        = "203.252.112.35"
+NumChild    = 0 
+ChildOffset = 0
+
+[[peer_addr]]  # D / Offset=3
+Addr        = "203.252.112.36"
+NumChild    = 1 #1
+ChildOffset = 4 #4
+
+[[peer_addr]]  # E / Offset=4
+Addr        = "203.252.112.37"
+NumChild    = 0
+ChildOffset = 0
+
+
+# FECTUN Arguments
+# 1. Single-Path without FEC
+#   ./fectun -a 203.252.112.32:6000 -u 203.252.112.32:5000 -s 203.252.112.32:6001 -d 203.252.112.31:6001
+# 2. Single-Path with FEC
+#   ./fectun -f -a 203.252.112.32:6000 -u 203.252.112.32:5000 -s 203.252.112.32:6001 -d 203.252.112.31:6001
+# 3. Mutli-Path without FEC
+#   ./fectun -a 203.252.112.32:6000 -u 203.252.112.32:5000 -s 203.252.112.32:6001 -s 192.168.10.3:6002 -d 203.252.112.31:6001 -d 192.168.10.2:6002
+# 4. Multi-Path with FEC 
+#   ./fectun -f -a 203.252.112.32:6000 -u 203.252.112.32:5000 -s 203.252.112.32:6001 -s 192.168.10.3:6002 -d 203.252.112.31:6001 -d 192.168.10.2:6002

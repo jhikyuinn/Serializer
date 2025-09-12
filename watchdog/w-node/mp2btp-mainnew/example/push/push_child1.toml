@@ -1,0 +1,34 @@
+# MP2BTP Configurations 
+
+# Verbose mode for Puctrl 
+VERBOSE_MODE        = true
+
+# Network address
+NUM_MULTIPATH       = 1
+MY_IP_ADDRS         = ["203.252.112.32", "192.168.10.3"]  # First IP is a primary path 
+LISTEN_PORT         = 4000
+BIND_PORT           = 5000
+
+# Enhanced QUIC
+EQUIC_ENABLE        = true
+EQUIC_PATH          = "../../mulctrl/fectun"
+EQUIC_APP_SRC_PORT  = 6000
+EQUIC_APP_DST_PORT  = 5000
+EQUIC_TUN_SRC_PORT  = 7000
+EQUIC_TUN_DST_PORT  = 7000
+EQUIC_FEC_MODE      = false
+
+# Segment Size 
+SEGMENT_SIZE        = 2097152  
+FEC_SEGMENT_SIZE    = 2466816  
+PULL_MODE           = 0
+
+# Others - to be updated 
+THROUGHPUT_PERIOD = 0.1 # sec
+THROUGHPUT_WEIGHT = 0.1 # 0 ~ 1.0
+MULTIPATH_THRESHOLD_THROUGHPUT = 1000.0 # Mbps
+MULTIPATH_THRESHOLD_SEND_COMPLETE_TIME = 0.0 # sec 
+CLOSE_TIMEOUT_PERIOD = 200 # ms
+MAX_CONNECTION_RETRY = 5
+PUSH_PULL_TRANSITION_TIMEOUT = 500 # ms
+FAULT_PEER = 3  # For push-to-pull transition experiment 

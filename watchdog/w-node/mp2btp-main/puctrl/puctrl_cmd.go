@@ -15,7 +15,7 @@ func DisablePacketForwarding() {
 	// //DOCKER
 	// cmd := "iptables -t nat --flush"
 	//LOCAL
-	cmd := "sudo iptables -t nat --flush"
+	cmd := "sudo iptables -w 5 -t nat --flush"
 	cmdArgs := strings.Fields(cmd)
 	util.Log("PuCtrl.DisablePacketForwarding(): %s", cmd, cmdArgs)
 	if err := RunCommand(cmdArgs[0], cmdArgs[1:]...); err != nil {
@@ -35,8 +35,8 @@ func EnablePacketForwarding(index uint16, isPullSender bool) {
 	// }
 	//LOCAL
 	cmdFmt := []string{
-		"sudo iptables -t nat %s PREROUTING -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
-		"sudo iptables -t nat %s OUTPUT -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
+		"sudo iptables -w 5 -t nat %s PREROUTING -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
+		"sudo iptables -w 5 -t nat %s OUTPUT -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
 	}
 
 	cmd := make([]string, 2)

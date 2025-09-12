@@ -3,6 +3,8 @@ package puctrl
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+	"log"
 	"sync"
 
 	"github.com/BurntSushi/toml"
@@ -11,6 +13,8 @@ import (
 	//pc "github.com/MCNL-HGU/mp2btp/puctrl/packet"
 	//equic "github.com/MCNL-HGU/Enhanced-quic"
 )
+
+var i = uint16(1)
 
 // -t means that it is a variable for testing.
 // It will be removed.
@@ -34,6 +38,43 @@ type PuCtrl struct {
 	chStopListen       chan bool // Stop goroutine for listening
 	chStopTransmission chan bool // Stop goroutine for sender's transmission
 	mutexSessionMap    sync.Mutex
+
+	AuditBroadcaster *Broadcaster
+	AuditMsgChan     chan *packet.AuditDataPacket
+	AuditMsgAckChan  chan *packet.AuditDataAckPacket
+}
+
+type Broadcaster struct {
+	mu        sync.Mutex
+	listeners []chan *packet.AuditDataPacket
+}
+
+func NewBroadcaster() *Broadcaster {
+	return &Broadcaster{
+		listeners: make([]chan *packet.AuditDataPacket, 0),
+	}
+}
+
+// 리스너 등록 (각 소비자마다 사용)
+func (b *Broadcaster) Register() chan *packet.AuditDataPacket {
+	ch := make(chan *packet.AuditDataPacket, 10) // 버퍼 조정 가능
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.listeners = append(b.listeners, ch)
+	return ch
+}
+
+// 메시지 브로드캐스트
+func (b *Broadcaster) Broadcast(pkt *packet.AuditDataPacket) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.listeners {
+		select {
+		case ch <- pkt:
+		default:
+			fmt.Println("⚠️ 채널이 가득 찼습니다. 해당 리스너는 메시지를 받지 못했을 수 있음")
+		}
+	}
 }
 
 // Singleton instance
@@ -69,6 +110,9 @@ func CreatePuCtrl(configFile string, peerID uint32) *PuCtrl {
 		numPullSession:      0,
 		chStopTransmission:  nil,
 		mutexSessionMap:     sync.Mutex{},
+		AuditMsgChan:        make(chan *packet.AuditDataPacket),
+		AuditMsgAckChan:     make(chan *packet.AuditDataAckPacket),
+		AuditBroadcaster:    NewBroadcaster(),
 	}
 
 	// Singletone instance
@@ -117,21 +161,27 @@ func (p *PuCtrl) Connect(nodeInfo []packet.NodeInfo, sessionType byte) {
 	// Get child node's address
 	p.childAddr = make([]string, 0)
 	for i := myInfo.OffsetOfChild; i < myInfo.OffsetOfChild+myInfo.NumOfChilds; i++ {
-		nodeAddr := fmt.Sprintf("%s:%d", util.Int2ip(nodeInfo[i].IP), nodeInfo[i].Port)
+		nodeAddr := fmt.Sprintf("%s:%d", util.Int2ip(nodeInfo[i].IP), 4100)
 		p.childAddr = append(p.childAddr, nodeAddr)
 	}
-
+	fmt.Println("CHILDLENGTH", len(p.childAddr), p.childAddr)
 	if len(p.childAddr) > 0 {
-		i := uint16(0)
+		count := 0
 		for _, peerAddr := range p.childAddr {
 			// My address
 			myBindAddr := fmt.Sprintf("%s:%d", Conf.MY_IP_ADDRS[0], Conf.BIND_PORT+uint16(i))
+			fmt.Println("📞", peerAddr, "📞", myBindAddr)
 
 			// Connect to peer
 			session := Connector(myBindAddr, peerAddr, sessionType)
 
-			util.Log("PuCtrl.Connect(): MyAddr=%s, PeerAddr=%s, SessionType=%d, SessionID=%d",
-				myBindAddr, peerAddr, sessionType, session.sessionID)
+			// util.Log("PuCtrl.Connect(): MyAddr=%s, PeerAddr=%s, SessionType=%d, SessionID=%d",
+			// 	myBindAddr, peerAddr, sessionType, session.sessionID)
+
+			if session == nil {
+				log.Println("❌ Failed to create session")
+				continue
+			}
 
 			// Send Node Info
 			session.sendNodeInfoPacket(nodeInfo)
@@ -141,8 +191,10 @@ func (p *PuCtrl) Connect(nodeInfo []packet.NodeInfo, sessionType byte) {
 
 			// Tricky method for test
 			i++
-			if Conf.NUM_PEERS > 0 && i == Conf.NUM_PEERS {
-				break
+			count++
+			fmt.Println("뭐죠뭐죠뭐죠", len(p.childAddr), i, count)
+			if count == len(p.childAddr) || len(p.childAddr) == 0 {
+
 			}
 		}
 	} else {
@@ -183,13 +235,11 @@ func (p *PuCtrl) Send(blockFileName string, blockNumber uint32) {
 func (p *PuCtrl) SendAuditMsg(data []byte) error {
 
 	isPushSessionExist := false
+	fmt.Println("[SESSIONMAP]", p.sessionMap)
 	for sessionID := range p.sessionMap {
-		fmt.Println("🥳SendAuditMsg", sessionID)
+		fmt.Println("💰", p.sessionMap[sessionID].sessionType, PUSH_SESSION)
 		if p.sessionMap[sessionID].sessionType == PUSH_SESSION {
-			err := p.SendRaw(sessionID, data)
-			if err != nil {
-				return fmt.Errorf("failed to send audit msg on session %d: %v", sessionID, err)
-			}
+			p.SendAuditInfo(sessionID, data)
 			isPushSessionExist = true
 		}
 	}
@@ -200,9 +250,27 @@ func (p *PuCtrl) SendAuditMsg(data []byte) error {
 	return nil
 }
 
+func (p *PuCtrl) SendAuditAckMsg(data []byte) error {
+
+	isPushSessionExist := false
+
+	fmt.Println("SendAuditAckMsgSendAuditAckMsgSendAuditAckMsgSendAuditAckMsgSendAuditAckMsgSendAuditAckMsg")
+	for sessionID := range p.sessionMap {
+		if p.sessionMap[sessionID].sessionType == PUSH_SESSION {
+			p.SendAuditAckInfo(sessionID, data)
+			isPushSessionExist = true
+		}
+	}
+
+	if !isPushSessionExist {
+		return fmt.Errorf("SendAuditAckMsg(): Push session does not exist")
+	}
+	return nil
+}
+
 // KYUKYU
 func (p *PuCtrl) SendRaw(sessionID uint32, data []byte) error {
-	// fmt.Println("🎉SendRaw", sessionID)
+	fmt.Println("🎉SendRaw", sessionID)
 	session, ok := p.sessionMap[sessionID]
 	if !ok {
 		return fmt.Errorf("session %d does not exist", sessionID)
@@ -210,42 +278,58 @@ func (p *PuCtrl) SendRaw(sessionID uint32, data []byte) error {
 
 	lenBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-	// fmt.Println("🎉SendRawdataLength", uint32(len(data)))
+	fmt.Println("🎉SendRawdataLength", uint32(len(data)), data)
 
-	if _, err := session.stream.Write(lenBuf); err != nil {
-		return fmt.Errorf("failed to write length prefix: %v", err)
-	}
+	session.sendPacket(data)
+	// if _, err := session.stream.Write(lenBuf); err != nil {
+	// 	return fmt.Errorf("failed to write length prefix: %v", err)
+	// }
 
-	_, err := session.stream.Write(data)
-	if err != nil {
-		return fmt.Errorf("failed to write data: %v", err)
-	}
-	// fmt.Println("🎉SendRawdata", data)
-	// session.stream.Close()
+	// _, err := session.stream.Write(data)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to write data: %v", err)
+	// }
 
 	return nil
 }
 
-// KYUKYU
-func (p *PuCtrl) ReceiveRaw(buf []byte) ([]byte, error) {
-	// fmt.Println("👑ReceiveRaw", p.sessionMap)
-	for sessionID := range p.sessionMap {
+func (p *PuCtrl) ReceiveAuditMsg(sessionID uint32, pkt *packet.AuditDataPacket) {
+	fmt.Println("ReceiveAuditMsgReceiveAuditMsgReceiveAuditMsgReceiveAuditMsgReceiveAuditMsgReceiveAuditMsg")
+	p.AuditBroadcaster.Broadcast(pkt)
+}
 
+func (p *PuCtrl) ReceiveAuditMsgAck(sessionID uint32, pkt *packet.AuditDataAckPacket) {
+	fmt.Println("ReceiveAuditMsgAckReceiveAuditMsgAckReceiveAuditMsgAckReceiveAuditMsgAckReceiveAuditMsgAck")
+	p.AuditMsgAckChan <- pkt
+}
+
+// KYUKYU
+
+func (p *PuCtrl) ReceiveRaw() ([]byte, error) {
+	for sessionID := range p.sessionMap {
 		session, ok := p.sessionMap[sessionID]
 		if !ok {
 			return nil, fmt.Errorf("session %d does not exist", sessionID)
 		}
-		n, err := session.stream.Read(buf)
-		// fmt.Println("👑ReceiveRawdataLength", n)
-		if err != nil {
-			return nil, err
-		}
-		// fmt.Println("👑ReceiveRawdata", buf[1:n])
-		// session.stream.Close()
 
-		return buf[:n], nil
+		// 먼저 길이 prefix (4바이트) 읽기
+		lenBuf := make([]byte, 4)
+		_, err := io.ReadFull(session.stream, lenBuf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read length prefix: %v", err)
+		}
+		dataLen := binary.BigEndian.Uint32(lenBuf)
+
+		// 실제 데이터 읽기
+		data := make([]byte, dataLen)
+		_, err = io.ReadFull(session.stream, data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read data: %v", err)
+		}
+
+		return data, nil
 	}
-	return nil, nil
+	return nil, fmt.Errorf("no active sessions")
 }
 
 // ReceiveBlock() function reads the requested block and stores it in the given byte slice.
@@ -304,9 +388,14 @@ func (p *PuCtrl) GetNodeInfo(peerAddr []PeerAddr) []packet.NodeInfo {
 	nodeInfo := make([]packet.NodeInfo, nodeInfosLen)
 
 	for i := 0; i < len(nodeInfo); i++ {
-		fmt.Println("🤎", nodeInfo)
+		// Set NodeInfo
 		nodeInfo[i].IP = util.Ip2int(peerAddr[i].Addr)
-		nodeInfo[i].Port = Conf.LISTEN_PORT
+		if peerAddr[i].NumChild == 0 {
+			nodeInfo[i].Port = 4100
+		}
+		if peerAddr[i].NumChild != 0 {
+			nodeInfo[i].Port = 4000
+		}
 		nodeInfo[i].NumOfChilds = peerAddr[i].NumChild
 		nodeInfo[i].OffsetOfChild = peerAddr[i].ChildOffset
 
@@ -315,4 +404,26 @@ func (p *PuCtrl) GetNodeInfo(peerAddr []PeerAddr) []packet.NodeInfo {
 	}
 
 	return nodeInfo
+}
+
+func (pu *PuCtrl) CloseAllSessions() {
+	pu.mutexSessionMap.Lock()
+	defer pu.mutexSessionMap.Unlock()
+
+	for sessionID, session := range pu.sessionMap {
+		fmt.Printf("🔌 Closing session %d\n", sessionID)
+		session.Close() // session.handler 내부에서 graceful하게 처리되면 더 좋음
+	}
+	pu.sessionMap = make(map[uint32]*PuSession)
+}
+
+func (p *PuCtrl) DisconnectFromChildren() {
+	for sessionID, session := range p.sessionMap {
+		for _, child := range p.childAddr {
+			fmt.Printf("🔌 Disconnecting from child: %s\n", child)
+			session.Close() // stream, session 종료
+			delete(p.sessionMap, sessionID)
+			break
+		}
+	}
 }

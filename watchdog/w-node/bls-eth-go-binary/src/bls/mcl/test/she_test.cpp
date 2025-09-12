@@ -33,6 +33,64 @@ CYBOZU_TEST_AUTO(log)
 	}
 }
 
+#ifdef NDEBUG
+CYBOZU_TEST_AUTO(window)
+{
+	const int C = 500;
+	G1 P, P2;
+	G2 Q, Q2;
+	GT e, e2;
+	mpz_class mr;
+	{
+		Fr r;
+		r.setRand();
+		mr = r.getMpz();
+	}
+	hashAndMapToG1(P, "abc");
+	hashAndMapToG2(Q, "abc");
+	pairing(e, P, Q);
+	P2.clear();
+	Q2.clear();
+	e2 = 1;
+
+	printf("large m\n");
+	CYBOZU_BENCH_C("G1window", C, SHE::PhashTbl_.mulByWindowMethod, P2, mr);
+	CYBOZU_BENCH_C("G2window", C, SHE::QhashTbl_.mulByWindowMethod, Q2, mr);
+	CYBOZU_BENCH_C("GTwindow", C, SHE::ePQhashTbl_.mulByWindowMethod, e, mr);
+}
+#endif
+
+CYBOZU_TEST_AUTO(ZkpSet)
+{
+//	cybozu::XorShift rg;
+//	mcl::fp::RandGen::setRandGen(rg);
+	const int mVec[] = { -7, 0, 1, 3, 5, 11, 23 };
+	const size_t mSizeMax = CYBOZU_NUM_OF_ARRAY(mVec);
+	Fr zkp[mSizeMax * 2];
+
+	SecretKey sec;
+	sec.setByCSPRNG();
+	PublicKey pub;
+	sec.getPublicKey(pub);
+	PrecomputedPublicKey ppub;
+	ppub.init(pub);
+
+	for (size_t mSize = 1; mSize <= mSizeMax; mSize++) {
+		CipherTextG1 c;
+		pub.encWithZkpSet(c, zkp, mVec[0], mVec, mSize);
+		CYBOZU_TEST_ASSERT(pub.verify(c, zkp, mVec, mSize));
+		CYBOZU_TEST_ASSERT(!pub.verify(c, zkp, mVec, mSize - 1));
+		zkp[0] += 1;
+		CYBOZU_TEST_ASSERT(!pub.verify(c, zkp, mVec, mSize));
+
+		ppub.encWithZkpSet(c, zkp, mVec[0], mVec, mSize);
+		CYBOZU_TEST_ASSERT(ppub.verify(c, zkp, mVec, mSize));
+		CYBOZU_TEST_ASSERT(!ppub.verify(c, zkp, mVec, mSize - 1));
+		zkp[0] += 1;
+		CYBOZU_TEST_ASSERT(!ppub.verify(c, zkp, mVec, mSize));
+	}
+}
+
 //#define PAPER
 #ifdef PAPER
 double clk2msec(const cybozu::CpuClock& clk, int n)
@@ -152,12 +210,13 @@ void HashTableTest(const G& P)
 {
 	mcl::she::local::HashTable<G> hashTbl, hashTbl2;
 	const int maxSize = 100;
-	const int tryNum = 3;
+	const int tryNum = 9;
 	hashTbl.init(P, maxSize, tryNum);
 	GAHashTableTest(maxSize, tryNum, P, hashTbl);
 	std::stringstream ss;
 	hashTbl.save(ss);
 	hashTbl2.load(ss);
+	hashTbl2.setTryNum(tryNum);
 	GAHashTableTest(maxSize, tryNum, P, hashTbl2);
 }
 
@@ -204,6 +263,7 @@ CYBOZU_TEST_AUTO(GTHashTable)
 	std::stringstream ss;
 	hashTbl.save(ss);
 	hashTbl2.load(ss);
+	hashTbl2.setTryNum(tryNum);
 	GTHashTableTest(maxSize, tryNum, g, hashTbl2);
 }
 
@@ -215,7 +275,7 @@ CYBOZU_TEST_AUTO(enc_dec)
 	PublicKey pub;
 	sec.getPublicKey(pub);
 	CipherText c;
-	for (int i = -5; i < 5; i++) {
+	for (int i = -50; i < 50; i++) {
 		pub.enc(c, i);
 		CYBOZU_TEST_EQUAL(sec.dec(c), i);
 		pub.reRand(c);
@@ -226,7 +286,7 @@ CYBOZU_TEST_AUTO(enc_dec)
 	CipherTextG1 c1;
 	CipherTextG2 c2;
 	CipherTextGT ct1, ct2;
-	for (int i = -5; i < 5; i++) {
+	for (int i = -50; i < 50; i++) {
 		pub.enc(ct1, i);
 		CYBOZU_TEST_EQUAL(sec.dec(ct1), i);
 		CYBOZU_TEST_EQUAL(sec.isZero(ct1), i == 0);
@@ -248,6 +308,80 @@ CYBOZU_TEST_AUTO(enc_dec)
 		CYBOZU_TEST_EQUAL(sec.dec(ct1), i);
 		pub.enc(c, i);
 		CYBOZU_TEST_EQUAL(sec.isZero(c), i == 0);
+	}
+}
+
+void normalizeCipher1(const CipherTextG1 *c1, size_t n)
+{
+	G1 cc;
+	for (size_t i = 0; i < n; i++) {
+		G1::normalize(cc, c1[i].getS());
+		G1::normalize(cc, c1[i].getT());
+	}
+}
+
+void normalizeCipher2(const CipherTextG1 *c1, size_t n)
+{
+	CipherTextG1 *cc = (CipherTextG1*)CYBOZU_ALLOCA(sizeof(CipherTextG1) * n);
+	for (size_t i = 0; i < n; i++) {
+		cc[i] = c1[i];
+	}
+	normalizeVec(cc, n);
+}
+
+CYBOZU_TEST_AUTO(normalizeVec)
+{
+	const size_t N = 32;
+	SecretKey& sec = g_sec;
+	PublicKey pub;
+	sec.getPublicKey(pub);
+	CipherTextG1 c1[N];
+	CipherTextG2 c2[N];
+	for (size_t i = 0; i < N; i++) {
+		pub.enc(c1[i], i);
+		pub.enc(c2[i], i);
+		CYBOZU_TEST_ASSERT(!c1[i].getS().z.isOne());
+		CYBOZU_TEST_ASSERT(!c1[i].getT().z.isOne());
+		CYBOZU_TEST_ASSERT(!c2[i].getS().z.isOne());
+		CYBOZU_TEST_ASSERT(!c2[i].getT().z.isOne());
+	}
+#ifdef NDEBUG
+	CYBOZU_BENCH_C("normalize one", 100, normalizeCipher1, c1, N);
+	CYBOZU_BENCH_C("normalizeVec", 100, normalizeCipher2, c1, N);
+#endif
+	normalizeVec(c1, N);
+	normalizeVec(c2, N);
+	for (size_t i = 0; i < N; i++) {
+		CYBOZU_TEST_ASSERT(c1[i].getS().z.isOne());
+		CYBOZU_TEST_ASSERT(c1[i].getT().z.isOne());
+		CYBOZU_TEST_ASSERT(c2[i].getS().z.isOne());
+		CYBOZU_TEST_ASSERT(c2[i].getT().z.isOne());
+		CYBOZU_TEST_EQUAL(sec.dec(c1[i]), (int)i);
+		CYBOZU_TEST_EQUAL(sec.dec(c2[i]), (int)i);
+	}
+	// G1
+	{
+		std::string s;
+		cybozu::StringOutputStream os(s);
+		serializeVecToAffine(os, c1, N);
+		CipherTextG1 cc[N];
+		cybozu::StringInputStream is(s);
+		deserializeVecFromAffine(cc, N, is);
+		for (size_t i = 0; i < N; i++) {
+			CYBOZU_TEST_EQUAL(sec.dec(cc[i]), (int)i);
+		}
+	}
+	// G2
+	{
+		std::string s;
+		cybozu::StringOutputStream os(s);
+		serializeVecToAffine(os, c2, N);
+		CipherTextG2 cc[N];
+		cybozu::StringInputStream is(s);
+		deserializeVecFromAffine(cc, N, is);
+		for (size_t i = 0; i < N; i++) {
+			CYBOZU_TEST_EQUAL(sec.dec(cc[i]), (int)i);
+		}
 	}
 }
 
@@ -285,7 +419,7 @@ void ZkpEqTest(const SecretKey& sec, const PubT& pub)
 	CipherTextG1 c1;
 	CipherTextG2 c2;
 	ZkpEq zkp;
-	for (int m = -4; m < 4; m++) {
+	for (int m = -50; m < 50; m++) {
 		pub.encWithZkpEq(c1, c2, zkp, m);
 		CYBOZU_TEST_EQUAL(sec.dec(c1), m);
 		CYBOZU_TEST_EQUAL(sec.dec(c2), m);
@@ -605,8 +739,6 @@ CYBOZU_TEST_AUTO(saveHash)
 	CYBOZU_TEST_ASSERT(hashTbl1 == hashTbl2);
 }
 
-static inline void putK(double t) { printf("%.2e\n", t * 1e-3); }
-
 template<class CT>
 void decBench(const char *msg, int C, const SecretKey& sec, const PublicKey& pub, int64_t (SecretKey::*dec)(const CT& c, bool *pok) const = &SecretKey::dec)
 {
@@ -630,9 +762,11 @@ void decBench(const char *msg, int C, const SecretKey& sec, const PublicKey& pub
 	}
 }
 
-#if !defined(PAPER) && defined(NDEBUG)
+#if 0 // !defined(PAPER) && defined(NDEBUG)
+static inline void putK(double t) { printf("%.2e\n", t * 1e-3); }
 CYBOZU_TEST_AUTO(hashBench)
 {
+	setTryNum(1024);
 	SecretKey& sec = g_sec;
 	sec.setByCSPRNG();
 	const int C = 500;
@@ -795,6 +929,7 @@ CYBOZU_TEST_AUTO(liftedElGamal)
 
 	n = pub.serialize(buf, sizeof(buf));
 	CYBOZU_TEST_EQUAL(n, byteSize + 1); // +1 is for sign of y
+	CYBOZU_TEST_EQUAL(n, G1::getSerializedByteSize());
 	PublicKey pub2;
 	n = pub2.deserialize(buf, n);
 	CYBOZU_TEST_EQUAL(n, byteSize + 1);
@@ -808,4 +943,8 @@ CYBOZU_TEST_AUTO(liftedElGamal)
 	CYBOZU_BENCH_C("enc", C, ppub.enc, c2, 5);
 	CYBOZU_TEST_EQUAL(sec.dec(c1), sec.dec(c2));
 	CYBOZU_BENCH_C("add", C, add, c1, c1, c2);
+	Fr r;
+	r.setByCSPRNG();
+	CYBOZU_BENCH_C("mul", C, mul, c1, c1, r);
+	CYBOZU_BENCH_C("isZero", C, sec.isZero, c1);
 }

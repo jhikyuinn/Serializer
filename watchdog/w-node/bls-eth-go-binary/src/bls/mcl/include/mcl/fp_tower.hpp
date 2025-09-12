@@ -10,25 +10,20 @@
 
 namespace mcl {
 
-template<class Fp> struct Fp12T;
+template<class Fp, class _Fr> struct Fp12T;
 template<class Fp> class BNT;
 template<class Fp> struct Fp2DblT;
 
 template<class Fp>
 class FpDblT : public fp::Serializable<FpDblT<Fp> > {
-	typedef fp::Unit Unit;
 	Unit v_[Fp::maxSize * 2];
 	friend struct Fp2DblT<Fp>;
 public:
 	static size_t getUnitSize() { return Fp::op_.N * 2; }
-	const fp::Unit *getUnit() const { return v_; }
+	const Unit *getUnit() const { return v_; }
 	void dump() const
 	{
-		const size_t n = getUnitSize();
-		for (size_t i = 0; i < n; i++) {
-			mcl::fp::dumpUnit(v_[n - 1 - i]);
-		}
-		printf("\n");
+		bint::dump(v_, getUnitSize());
 	}
 	template<class OutputStream>
 	void save(bool *pb, OutputStream& os, int) const
@@ -182,7 +177,6 @@ template<class _Fp>
 class Fp2T : public fp::Serializable<Fp2T<_Fp>,
 	fp::Operator<Fp2T<_Fp> > > {
 	typedef _Fp Fp;
-	typedef fp::Unit Unit;
 	typedef FpDblT<Fp> FpDbl;
 	typedef Fp2DblT<Fp> Fp2Dbl;
 	static const size_t gN = 5;
@@ -324,7 +318,7 @@ public:
 	void load(bool *pb, InputStream& is, int ioMode)
 	{
 		Fp *ap = &a, *bp = &b;
-		if (Fp::isETHserialization_ && ioMode & (IoSerialize | IoSerializeHexStr)) {
+		if (Fp::getETHserialization() && ioMode & (IoSerialize | IoSerializeHexStr)) {
 			fp::swap_(ap, bp);
 		}
 		ap->load(pb, is, ioMode);
@@ -338,7 +332,7 @@ public:
 	void save(bool *pb, OutputStream& os, int ioMode) const
 	{
 		const Fp *ap = &a, *bp = &b;
-		if (Fp::isETHserialization_ && ioMode & (IoSerialize | IoSerializeHexStr)) {
+		if (Fp::getETHserialization() && ioMode & (IoSerialize | IoSerializeHexStr)) {
 			fp::swap_(ap, bp);
 		}
 		const char sep = *fp::getIoSeparator(ioMode);
@@ -406,7 +400,11 @@ public:
 		FpDbl AA, BB;
 		FpDbl::sqrPre(AA, x.a);
 		FpDbl::sqrPre(BB, x.b);
-		FpDbl::addPre(AA, AA, BB);
+		if (Fp::getOp().isFullBit) {
+			FpDbl::add(AA, AA, BB);
+		} else {
+			FpDbl::addPre(AA, AA, BB);
+		}
 		FpDbl::mod(y, AA);
 	}
 	/*
@@ -431,74 +429,7 @@ public:
 	}
 
 	static uint32_t get_xi_a() { return Fp::getOp().xi_a; }
-	static void init(bool *pb)
-	{
-		mcl::fp::Op& op = Fp::op_;
-		assert(op.xi_a);
-		// assume p < W/4 where W = 1 << (N * sizeof(Unit) * 8)
-		if ((op.p[op.N - 1] >> (sizeof(fp::Unit) * 8 - 2)) != 0) {
-			*pb = false;
-			return;
-		}
-#ifdef MCL_XBYAK_DIRECT_CALL
-		if (op.fp2_addA_ == 0) {
-			op.fp2_addA_ = addA;
-		}
-		if (op.fp2_subA_ == 0) {
-			op.fp2_subA_ = subA;
-		}
-		if (op.fp2_negA_ == 0) {
-			op.fp2_negA_ = negA;
-		}
-		if (op.fp2_mulA_ == 0) {
-			op.fp2_mulA_ = mulA;
-		}
-		if (op.fp2_sqrA_ == 0) {
-			op.fp2_sqrA_ = sqrA;
-		}
-		if (op.fp2_mul2A_ == 0) {
-			op.fp2_mul2A_ = mul2A;
-		}
-#endif
-		if (op.fp2_mul_xiA_ == 0) {
-			if (op.xi_a == 1) {
-				op.fp2_mul_xiA_ = fp2_mul_xi_1_1iA;
-			} else {
-				op.fp2_mul_xiA_ = fp2_mul_xiA;
-			}
-		}
-		FpDblT<Fp>::init();
-		Fp2DblT<Fp>::init();
-		// call init before Fp2::pow because FpDbl is used in Fp2T
-		const Fp2T xi(op.xi_a, 1);
-		const mpz_class& p = Fp::getOp().mp;
-		Fp2T::pow(g[0], xi, (p - 1) / 6); // g = xi^((p-1)/6)
-		for (size_t i = 1; i < gN; i++) {
-			g[i] = g[i - 1] * g[0];
-		}
-		/*
-			permutate [0, 1, 2, 3, 4] => [1, 3, 0, 2, 4]
-			g[0] = g^2
-			g[1] = g^4
-			g[2] = g^1
-			g[3] = g^3
-			g[4] = g^5
-		*/
-		{
-			Fp2T t = g[0];
-			g[0] = g[1];
-			g[1] = g[3];
-			g[3] = g[2];
-			g[2] = t;
-		}
-		for (size_t i = 0; i < gN; i++) {
-			Fp2T t(g[i].a, g[i].b);
-			if (Fp::getOp().pmod4 == 3) Fp::neg(t.b, t.b);
-			Fp2T::mul(g2[i], t, g[i]);
-			g3[i] = g[i] * g2[i];
-		}
-		*pb = true;
-	}
+	static void init(bool *pb);
 #ifndef CYBOZU_DONT_USE_EXCEPTION
 	static void init()
 	{
@@ -598,7 +529,6 @@ private:
 		const Fp2T& x = cast(px);
 		const Fp& a = x.a;
 		const Fp& b = x.b;
-#if 1 // faster than using FpDbl
 		Fp t1, t2, t3;
 		Fp::mul2(t1, b);
 		t1 *= a; // 2ab
@@ -606,17 +536,6 @@ private:
 		Fp::sub(t3, a, b); // a - b
 		Fp::mul(y.a, t2, t3); // (a + b)(a - b)
 		y.b = t1;
-#else
-		Fp t1, t2;
-		FpDbl d1, d2;
-		Fp::addPre(t1, b, b); // 2b
-		FpDbl::mulPre(d2, t1, a); // 2ab
-		Fp::addPre(t1, a, b); // a + b
-		Fp::sub(t2, a, b); // a - b
-		FpDbl::mulPre(d1, t1, t2); // (a + b)(a - b)
-		FpDbl::mod(py[0], d1);
-		FpDbl::mod(py[1], d2);
-#endif
 	}
 	/*
 		xi = xi_a + i
@@ -659,7 +578,6 @@ struct Fp2DblT {
 	typedef Fp2DblT<Fp> Fp2Dbl;
 	typedef FpDblT<Fp> FpDbl;
 	typedef Fp2T<Fp> Fp2;
-	typedef fp::Unit Unit;
 	FpDbl a, b;
 	static void add(Fp2DblT& z, const Fp2DblT& x, const Fp2DblT& y)
 	{
@@ -685,10 +603,15 @@ struct Fp2DblT {
 		imaginary part of Fp2Dbl::mul uses only add,
 		so it does not require mod.
 	*/
+	template<bool isLtQuad>
 	static void subSpecial(Fp2DblT& y, const Fp2DblT& x)
 	{
 		FpDbl::sub(y.a, y.a, x.a);
-		FpDbl::subPre(y.b, y.b, x.b);
+		if (isLtQuad) {
+			FpDbl::subPre(y.b, y.b, x.b);
+		} else {
+			FpDbl::sub(y.b, y.b, x.b);
+		}
 	}
 	static void neg(Fp2DblT& y, const Fp2DblT& x)
 	{
@@ -722,13 +645,21 @@ struct Fp2DblT {
 	void operator-=(const Fp2DblT& x) { sub(*this, *this, x); }
 	static void init()
  	{
-		assert(!Fp::getOp().isFullBit);
+		bool isFullBit = Fp::getOp().isFullBit;
 		mcl::fp::Op& op = Fp::getOpNonConst();
 		if (op.fp2Dbl_mulPreA_ == 0) {
-			op.fp2Dbl_mulPreA_ = mulPreA;
+			if (isFullBit) {
+				op.fp2Dbl_mulPreA_ = mulPreA<true>;
+			} else {
+				op.fp2Dbl_mulPreA_ = mulPreA<false>;
+			}
 		}
 		if (op.fp2Dbl_sqrPreA_ == 0) {
-			op.fp2Dbl_sqrPreA_ = sqrPreA;
+			if (isFullBit) {
+				op.fp2Dbl_sqrPreA_ = sqrPreA<true>;
+			} else {
+				op.fp2Dbl_sqrPreA_ = sqrPreA<false>;
+			}
 		}
 		if (op.fp2Dbl_mul_xiA_ == 0) {
 			const uint32_t xi_a = Fp2::get_xi_a();
@@ -748,12 +679,12 @@ private:
 		Fp2Dbl::mulPre by FpDblT
 		@note mod of NIST_P192 is fast
 	*/
+	template<bool isFullBit>
 	static void mulPreA(Unit *pz, const Unit *px, const Unit *py)
 	{
 		Fp2Dbl& z = castD(pz);
 		const Fp2& x = cast(px);
 		const Fp2& y = cast(py);
-		assert(!Fp::getOp().isFullBit);
 		const Fp& a = x.a;
 		const Fp& b = x.b;
 		const Fp& c = y.a;
@@ -762,23 +693,38 @@ private:
 		FpDbl& d1 = z.b;
 		FpDbl d2;
 		Fp s, t;
-		Fp::addPre(s, a, b);
-		Fp::addPre(t, c, d);
+		if (isFullBit) {
+			Fp::add(s, a, b);
+			Fp::add(t, c, d);
+		} else {
+			Fp::addPre(s, a, b);
+			Fp::addPre(t, c, d);
+		}
 		FpDbl::mulPre(d1, s, t); // (a + b)(c + d)
 		FpDbl::mulPre(d0, a, c);
 		FpDbl::mulPre(d2, b, d);
-		FpDbl::subPre(d1, d1, d0);
-		FpDbl::subPre(d1, d1, d2);
+		if (isFullBit) {
+			FpDbl::sub(d1, d1, d0);
+			FpDbl::sub(d1, d1, d2);
+		} else {
+			FpDbl::subPre(d1, d1, d0);
+			FpDbl::subPre(d1, d1, d2);
+		}
 		FpDbl::sub(d0, d0, d2); // ac - bd
 	}
+	template<bool isFullBit>
 	static void sqrPreA(Unit *py, const Unit *px)
 	{
-		assert(!Fp::getOp().isFullBit);
 		Fp2Dbl& y = castD(py);
 		const Fp2& x = cast(px);
 		Fp t1, t2;
-		Fp::addPre(t1, x.b, x.b); // 2b
-		Fp::addPre(t2, x.a, x.b); // a + b
+		if (isFullBit) {
+			Fp::add(t1, x.b, x.b); // 2b
+			Fp::add(t2, x.a, x.b); // a + b
+		} else {
+			Fp::addPre(t1, x.b, x.b); // 2b
+			Fp::addPre(t2, x.a, x.b); // a + b
+		}
 		FpDbl::mulPre(y.b, t1, x.a); // 2ab
 		Fp::sub(t1, x.a, x.b); // a - b
 		FpDbl::mulPre(y.a, t1, t2); // (a + b)(a - b)
@@ -981,7 +927,7 @@ struct Fp6T : public fp::Serializable<Fp6T<_Fp>,
 		Fp2Dbl::add(T, T, T2);
 		Fp2Dbl::mul_xi(T, T);
 		Fp2Dbl::mulPre(T2, p.a, a);
-		Fp2Dbl::addPre(T, T, T2);
+		Fp2Dbl::add(T, T, T2);
 		Fp2 q;
 		Fp2Dbl::mod(q, T);
 		Fp2::inv(q, q);
@@ -999,7 +945,6 @@ struct Fp6DblT {
 	typedef FpDblT<Fp> FpDbl;
 	typedef Fp2DblT<Fp> Fp2Dbl;
 	typedef Fp6DblT<Fp> Fp6Dbl;
-	typedef fp::Unit Unit;
 	Fp2Dbl a, b, c;
 	static void add(Fp6Dbl& z, const Fp6Dbl& x, const Fp6Dbl& y)
 	{
@@ -1013,6 +958,7 @@ struct Fp6DblT {
 		Fp2Dbl::sub(z.b, x.b, y.b);
 		Fp2Dbl::sub(z.c, x.c, y.c);
 	}
+	static void (*mulPre)(Fp6DblT& z, const Fp6& x, const Fp6& y);
 	/*
 		x = a + bv + cv^2, y = d + ev + fv^2, v^3 = xi
 		xy = (ad + (bf + ce)xi) + ((ae + bd) + cf xi)v + ((af + cd) + be)v^2
@@ -1022,7 +968,8 @@ struct Fp6DblT {
 		assum p < W/4 where W = 1 << (sizeof(Unit) * 8 * N)
 		then (b + c)(e + f) < 4p^2 < pW
 	*/
-	static void mulPre(Fp6DblT& z, const Fp6& x, const Fp6& y)
+	template<bool isLtQuad>
+	static void mulPreT(Fp6DblT& z, const Fp6& x, const Fp6& y)
 	{
 		const Fp2& a = x.a;
 		const Fp2& b = x.b;
@@ -1035,24 +982,39 @@ struct Fp6DblT {
 		Fp2Dbl& ZC = z.c;
 		Fp2 t1, t2;
 		Fp2Dbl BE, CF, AD;
-		Fp2::addPre(t1, b, c);
-		Fp2::addPre(t2, e, f);
+		if (isLtQuad) {
+			Fp2::addPre(t1, b, c);
+			Fp2::addPre(t2, e, f);
+		} else {
+			Fp2::add(t1, b, c);
+			Fp2::add(t2, e, f);
+		}
 		Fp2Dbl::mulPre(ZA, t1, t2);
-		Fp2::addPre(t1, a, b);
-		Fp2::addPre(t2, e, d);
+		if (isLtQuad) {
+			Fp2::addPre(t1, a, b);
+			Fp2::addPre(t2, e, d);
+		} else {
+			Fp2::add(t1, a, b);
+			Fp2::add(t2, e, d);
+		}
 		Fp2Dbl::mulPre(ZB, t1, t2);
-		Fp2::addPre(t1, a, c);
-		Fp2::addPre(t2, d, f);
+		if (isLtQuad) {
+			Fp2::addPre(t1, a, c);
+			Fp2::addPre(t2, d, f);
+		} else {
+			Fp2::add(t1, a, c);
+			Fp2::add(t2, d, f);
+		}
 		Fp2Dbl::mulPre(ZC, t1, t2);
 		Fp2Dbl::mulPre(BE, b, e);
 		Fp2Dbl::mulPre(CF, c, f);
 		Fp2Dbl::mulPre(AD, a, d);
-		Fp2Dbl::subSpecial(ZA, BE);
-		Fp2Dbl::subSpecial(ZA, CF);
-		Fp2Dbl::subSpecial(ZB, AD);
-		Fp2Dbl::subSpecial(ZB, BE);
-		Fp2Dbl::subSpecial(ZC, AD);
-		Fp2Dbl::subSpecial(ZC, CF);
+		Fp2Dbl::template subSpecial<isLtQuad>(ZA, BE);
+		Fp2Dbl::template subSpecial<isLtQuad>(ZA, CF);
+		Fp2Dbl::template subSpecial<isLtQuad>(ZB, AD);
+		Fp2Dbl::template subSpecial<isLtQuad>(ZB, BE);
+		Fp2Dbl::template subSpecial<isLtQuad>(ZC, AD);
+		Fp2Dbl::template subSpecial<isLtQuad>(ZC, CF);
 		Fp2Dbl::mul_xi(ZA, ZA);
 		Fp2Dbl::add(ZA, ZA, AD);
 		Fp2Dbl::mul_xi(CF, CF);
@@ -1095,20 +1057,34 @@ struct Fp6DblT {
 		Fp2Dbl::mod(y.b, x.b);
 		Fp2Dbl::mod(y.c, x.c);
 	}
+	static void init()
+	{
+		const mcl::fp::Op& op = Fp::getOp();
+		if (op.isLtQuad) {
+			mulPre = mulPreT<true>;
+		} else {
+			mulPre = mulPreT<false>;
+		}
+	}
 };
+
+template<class Fp> void (*Fp6DblT<Fp>::mulPre)(Fp6DblT<Fp>&, const Fp6T<Fp>&, const Fp6T<Fp>&) = 0;//mulPreT<false>;
 
 /*
 	Fp12T = Fp6[w] / (w^2 - v)
 	x = a + b w
 */
-template<class Fp>
-struct Fp12T : public fp::Serializable<Fp12T<Fp>,
-	fp::Operator<Fp12T<Fp> > > {
+template<class Fp, class _Fr>
+struct Fp12T : public fp::Serializable<Fp12T<Fp, _Fr>,
+	fp::Operator<Fp12T<Fp, _Fr> > > {
+	typedef fp::Serializable<Fp12T<Fp, _Fr>, fp::Operator<Fp12T<Fp, _Fr> > > BaseClass;
+
 	typedef Fp2T<Fp> Fp2;
 	typedef Fp6T<Fp> Fp6;
 	typedef Fp2DblT<Fp> Fp2Dbl;
 	typedef Fp6DblT<Fp> Fp6Dbl;
 	typedef Fp BaseFp;
+	typedef _Fr Fr; // group order
 	Fp6 a, b;
 	Fp12T() {}
 	Fp12T(int64_t a) : a(a), b(0) {}
@@ -1361,6 +1337,81 @@ struct Fp12T : public fp::Serializable<Fp12T<Fp>,
 		return os;
 	}
 #endif
+	static void setPowVecGLV(bool f(Fp12T& z, const Fp12T *xVec, const void *yVec, size_t yn) = 0)
+	{
+		BaseClass::powVecGLV = f;
+	}
+	static inline void powVec(Fp12T& z, const Fp12T *xVec, const Fp12T::Fr *yVec, size_t n)
+	{
+		if (n == 0) {
+			z.clear();
+			return;
+		}
+		if (BaseClass::powVecGLV && BaseClass::powVecGLV(z, xVec, yVec, n)) {
+			return;
+		}
+		size_t done = powVecN(z, xVec, yVec, n);
+		for (;;) {
+			xVec += done;
+			yVec += done;
+			n -= done;
+			if (n == 0) break;
+			Fp12T t;
+			done = powVecN(t, xVec, yVec, n);
+			z *= t;
+		}
+	}
+private:
+	template<class G, class Vec>
+	static void mulTbl(G& Q, const G *tbl, const Vec& naf, size_t i)
+	{
+		if (i >= naf.size()) return;
+		int n = naf[i];
+		if (n > 0) {
+			Q *= tbl[(n - 1) >> 1];
+		} else if (n < 0) {
+//			Q -= tbl[(-n - 1) >> 1];
+			G inv;
+			G::unitaryInv(inv, tbl[(-n - 1) >> 1]);
+			Q *= inv;
+		}
+	}
+
+	template<class tag, size_t maxBitSize, template<class _tag, size_t _maxBitSize>class FpT>
+	static inline size_t powVecN(Fp12T& z, const Fp12T *xVec, const FpT<tag, maxBitSize> *yVec, size_t n)
+	{
+		const size_t N = mcl::fp::maxMulVecN;
+		if (n > N) n = N;
+		const int w = 5;
+		const size_t tblSize = 1 << (w - 2);
+		typedef mcl::FixedArray<int8_t, sizeof(Fp12T::BaseFp) * 8 + 1> NafArray;
+		NafArray naf[N];
+		Fp12T tbl[N][tblSize];
+		size_t maxBit = 0;
+		mpz_class y;
+		for (size_t i = 0; i < n; i++) {
+			bool b;
+			yVec[i].getMpz(&b, y);
+			assert(b); (void)b;
+			gmp::getNAFwidth(&b, naf[i], y, w);
+			assert(b); (void)b;
+			if (naf[i].size() > maxBit) maxBit = naf[i].size();
+			Fp12T P2;
+			Fp12T::sqr(P2, xVec[i]);
+			tbl[i][0] = xVec[i];
+			for (size_t j = 1; j < tblSize; j++) {
+				Fp12T::mul(tbl[i][j], tbl[i][j - 1], P2);
+			}
+		}
+		z = 1;
+		for (size_t i = 0; i < maxBit; i++) {
+			Fp12T::sqr(z, z);
+			for (size_t j = 0; j < n; j++) {
+				mulTbl(z, tbl[j], naf[j], maxBit - 1 - i);
+			}
+		}
+		return n;
+	}
 };
 
 /*
@@ -1417,9 +1468,84 @@ struct GroupMtoA : public T {
 		sub(*this, *this, rhs);
 	}
 	void normalize() {}
+	static void normalizeVec(GroupMtoA *y, const GroupMtoA *x, size_t n)
+	{
+		if (y == x) return;
+		for (size_t i = 0; i < n; i++) y[i] = x[i];
+	}
+	static void mulArray(GroupMtoA& z, const GroupMtoA& x, const Unit *y, size_t yn)
+	{
+		T::powArray(z, x, y, yn);
+	}
 private:
 	bool isOne() const;
 };
+
+template<class _Fp> void Fp2T<_Fp>::init(bool *pb)
+{
+	typedef _Fp Fp;
+	mcl::fp::Op& op = Fp::op_;
+	assert(op.xi_a);
+#ifdef MCL_XBYAK_DIRECT_CALL
+	if (op.fp2_addA_ == 0) {
+		op.fp2_addA_ = addA;
+	}
+	if (op.fp2_subA_ == 0) {
+		op.fp2_subA_ = subA;
+	}
+	if (op.fp2_negA_ == 0) {
+		op.fp2_negA_ = negA;
+	}
+	if (op.fp2_mulA_ == 0) {
+		op.fp2_mulA_ = mulA;
+	}
+	if (op.fp2_sqrA_ == 0) {
+		op.fp2_sqrA_ = sqrA;
+	}
+	if (op.fp2_mul2A_ == 0) {
+		op.fp2_mul2A_ = mul2A;
+	}
+#endif
+	if (op.fp2_mul_xiA_ == 0) {
+		if (op.xi_a == 1) {
+			op.fp2_mul_xiA_ = fp2_mul_xi_1_1iA;
+		} else {
+			op.fp2_mul_xiA_ = fp2_mul_xiA;
+		}
+	}
+	FpDblT<Fp>::init();
+	Fp2DblT<Fp>::init();
+	// call init before Fp2::pow because FpDbl is used in Fp2T
+	const Fp2T xi(op.xi_a, 1);
+	const mpz_class& p = Fp::getOp().mp;
+	Fp2T::pow(g[0], xi, (p - 1) / 6); // g = xi^((p-1)/6)
+	for (size_t i = 1; i < gN; i++) {
+		g[i] = g[i - 1] * g[0];
+	}
+	/*
+		permutate [0, 1, 2, 3, 4] => [1, 3, 0, 2, 4]
+		g[0] = g^2
+		g[1] = g^4
+		g[2] = g^1
+		g[3] = g^3
+		g[4] = g^5
+	*/
+	{
+		Fp2T t = g[0];
+		g[0] = g[1];
+		g[1] = g[3];
+		g[3] = g[2];
+		g[2] = t;
+	}
+	for (size_t i = 0; i < gN; i++) {
+		Fp2T t(g[i].a, g[i].b);
+		if (Fp::getOp().pmod4 == 3) Fp::neg(t.b, t.b);
+		Fp2T::mul(g2[i], t, g[i]);
+		g3[i] = g[i] * g2[i];
+	}
+	Fp6DblT<Fp>::init();
+	*pb = true;
+}
 
 } // mcl
 

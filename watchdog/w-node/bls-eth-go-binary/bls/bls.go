@@ -16,6 +16,8 @@ import (
 	"unsafe"
 )
 
+const ethMode = true
+
 const EthModeOld = C.BLS_ETH_MODE_OLD
 const EthModeDraft05 = C.BLS_ETH_MODE_DRAFT_05
 const EthModeDraft06 = C.BLS_ETH_MODE_DRAFT_06
@@ -29,21 +31,29 @@ func hex2byte(s string) ([]byte, error) {
 	return hex.DecodeString(s)
 }
 
+// SetETHmode --
+// Set hash function
+// mode = EthModeOld or EthModeLatest(=EthModeDraft07)
+// error if curve != MCL_BLS12_381
+func SetETHmode(mode int) error {
+	if C.blsSetETHmode(C.int(mode)) != 0 {
+		return fmt.Errorf("ERR SetETHmode")
+	}
+	return nil
+}
+
 // Init --
 // call this function before calling all the other operations
 // this function is not thread safe
 func Init(curve int) error {
-	if curve != C.MCL_BLS12_381 {
-		return fmt.Errorf("ERR only BLS12-381")
-	}
 	err := C.blsInit(C.int(curve), C.MCLBN_COMPILED_TIME_VAR)
 	if err != 0 {
 		return fmt.Errorf("ERR Init curve=%d", curve)
 	}
-	if err := SetETHmode(EthModeDraft07); err != nil {
-		return fmt.Errorf("ERR SetETHmode")
+	if !ethMode {
+		return nil
 	}
-	return nil
+	return SetETHmode(C.BLS_ETH_MODE_LATEST)
 }
 
 // ID --
@@ -160,7 +170,7 @@ type SecretKey struct {
 
 // Serialize --
 func (sec *SecretKey) Serialize() []byte {
-	buf := make([]byte, 32)
+	buf := make([]byte, C.mclBn_getFpByteSize())
 	// #nosec
 	n := C.blsSecretKeySerialize(unsafe.Pointer(&buf[0]), C.mclSize(len(buf)), &sec.v)
 	if n == 0 {
@@ -372,7 +382,7 @@ func (keys PublicKeys) JSON() string {
 
 // Serialize --
 func (pub *PublicKey) Serialize() []byte {
-	buf := make([]byte, 48)
+	buf := make([]byte, C.blsGetSerializedPublicKeyByteSize())
 	// #nosec
 	n := C.blsPublicKeySerialize(unsafe.Pointer(&buf[0]), C.mclSize(len(buf)), &pub.v)
 	if n == 0 {
@@ -482,7 +492,7 @@ type Sign struct {
 
 // Serialize --
 func (sig *Sign) Serialize() []byte {
-	buf := make([]byte, 96)
+	buf := make([]byte, C.blsGetSerializedSignatureByteSize())
 	// #nosec
 	n := C.blsSignatureSerialize(unsafe.Pointer(&buf[0]), C.mclSize(len(buf)), &sig.v)
 	if n == 0 {

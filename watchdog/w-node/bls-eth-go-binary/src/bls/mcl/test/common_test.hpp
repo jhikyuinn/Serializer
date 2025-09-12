@@ -15,31 +15,61 @@ void naiveMulVec(G& out, const G *xVec, const Fr *yVec, size_t n)
 }
 
 template<class G>
+void mulVecCopy(G& z, G *x, const Fr *y, size_t n, const G* x0)
+{
+	for (size_t i = 0; i < n; i++) x[i] = x0[i];
+	G::mulVec(z, x, y, n);
+}
+
+template<class G>
 void testMulVec(const G& P)
 {
 	using namespace mcl::bn;
-	const int N = 33;
-	G xVec[N];
-	Fr yVec[N];
+	const int N = 4096;
+	std::vector<G> x0Vec(N);
+	std::vector<G> xVec(N);
+	std::vector<Fr> yVec(N);
 
+	cybozu::XorShift rg;
 	for (size_t i = 0; i < N; i++) {
-		G::mul(xVec[i], P, i + 3);
-		yVec[i].setByCSPRNG();
+		G::mul(x0Vec[i], P, i + 3);
+		if (i == 30) {
+			x0Vec[i].clear(); // x0Vec[i] contains zero value
+		}
+		xVec[i] = x0Vec[i];
+		yVec[i].setByCSPRNG(rg);
 	}
-	const size_t nTbl[] = { 1, 2, 3, 5, 7, 8, 9, 14, 15, 16, 30, 31, 32, 33 };
+	const size_t nTbl[] = { 1, 2, 3, 15, 16, 17, 32, 64, 128, 256,
+#if 0
+		512, 1024, 2048, N
+#endif
+	};
 	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(nTbl); i++) {
 		const size_t n = nTbl[i];
 		G Q1, Q2;
 		CYBOZU_TEST_ASSERT(n <= N);
-		naiveMulVec(Q1, xVec, yVec, n);
-		G::mulVec(Q2, xVec, yVec, n);
+		naiveMulVec(Q1, xVec.data(), yVec.data(), n);
+		G::mulVec(Q2, xVec.data(), yVec.data(), n);
 		CYBOZU_TEST_EQUAL(Q1, Q2);
-#if 0//#ifdef NDEBUG
+		Q2.clear();
+#if 0 // #ifdef NDEBUG
 		printf("n=%zd\n", n);
-		const int C = 400;
-		CYBOZU_BENCH_C("naive ", C, naiveMulVec, Q1, xVec, yVec, n);
-		CYBOZU_BENCH_C("mulVec", C, G::mulVec, Q1, xVec, yVec, n);
+		const int C = 10;
+		CYBOZU_BENCH_C("naive ", C, naiveMulVec, Q1, xVec.data(), yVec.data(), n);
+		CYBOZU_BENCH_C("mulVec", C, G::mulVec, Q1, xVec.data(), yVec.data(), n);
+		CYBOZU_BENCH_C("mulVecCopy", C, mulVecCopy, Q1, xVec.data(), yVec.data(), n, x0Vec.data());
 #endif
+	}
+	puts("mulEach");
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(nTbl); i++) {
+		const size_t n = nTbl[i];
+		xVec = x0Vec;
+		G::mulEach(xVec.data(), yVec.data(), n);
+		for (size_t j = 0; j < n; j++) {
+			G T;
+			G::mul(T, x0Vec[j], yVec[j]);
+			CYBOZU_TEST_EQUAL(xVec[j], T);
+		}
 	}
 }
 
@@ -68,9 +98,10 @@ inline void testPowVec(const G& e)
 	Fr yVec[N];
 
 	xVec[0] = e;
+	cybozu::XorShift rg;
 	for (size_t i = 0; i < N; i++) {
 		if (i > 0) G::mul(xVec[i], xVec[i - 1], e);
-		yVec[i].setByCSPRNG();
+		yVec[i].setByCSPRNG(rg);
 	}
 	const size_t nTbl[] = { 1, 2, 3, 5, 7, 8, 9, 14, 15, 16, 30, 31, 32, 33 };
 	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(nTbl); i++) {
@@ -128,15 +159,26 @@ void testMul2()
 
 void testABCDsub(const Fp2& a, const Fp2& b, const Fp2& c, const Fp2& d)
 {
+	const bool isLtQuad = Fp::getOp().isLtQuad;
 	Fp2 t1, t2;
-	Fp2::addPre(t1, a, b);
-	Fp2::addPre(t2, c, d);
+	if (isLtQuad) {
+		Fp2::addPre(t1, a, b);
+		Fp2::addPre(t2, c, d);
+	} else {
+		Fp2::add(t1, a, b);
+		Fp2::add(t2, c, d);
+	}
 	Fp2Dbl T1, AC, BD;
 	Fp2Dbl::mulPre(T1, t1, t2);
 	Fp2Dbl::mulPre(AC, a, c);
 	Fp2Dbl::mulPre(BD, b, d);
-	Fp2Dbl::subSpecial(T1, AC);
-	Fp2Dbl::subSpecial(T1, BD);
+	if (isLtQuad) {
+		Fp2Dbl::subSpecial<true>(T1, AC);
+		Fp2Dbl::subSpecial<true>(T1, BD);
+	} else {
+		Fp2Dbl::subSpecial<false>(T1, AC);
+		Fp2Dbl::subSpecial<false>(T1, BD);
+	}
 	Fp2Dbl::mod(t1, T1);
 	CYBOZU_TEST_EQUAL(t1, a * d + b * c);
 }
@@ -152,10 +194,11 @@ void testABCD()
 	a[2] = a[0];
 	a[3] = a[0];
 	testABCDsub(a[0], a[1], a[2], a[3]);
+	cybozu::XorShift rg;
 	for (int i = 0; i < 100; i++) {
 		for (int j = 0; j < 4; j++) {
-			a[j].a.setByCSPRNG();
-			a[j].b.setByCSPRNG();
+			a[j].a.setByCSPRNG(rg);
+			a[j].b.setByCSPRNG(rg);
 		}
 		testABCDsub(a[0], a[1], a[2], a[3]);
 	}
@@ -204,9 +247,27 @@ void testMulSmall()
 	}
 }
 
+void testPow()
+{
+	puts("testPow");
+	cybozu::XorShift rg;
+	Fp x, z1, z2;
+	x.setByCSPRNG(rg);
+	z1 = 1;
+	mpz_class my;
+	for (mcl::Unit y = 0; y < 100; y++) {
+//		Fp::pow(z2, x, y);
+//		CYBOZU_TEST_EQUAL(z1, z2);
+		mcl::fp::powUnit(z2, x, &y, 1);
+		CYBOZU_TEST_EQUAL(z1, z2);
+		z1 *= x;
+	}
+}
+
 void testCommon(const G1& P, const G2& Q)
 {
 	testMulSmall();
+	testPow();
 	testFp2Dbl_mul_xi1();
 	testABCD();
 	testMul2();
@@ -219,4 +280,8 @@ void testCommon(const G1& P, const G2& Q)
 	mcl::bn::pairing(e, P, Q);
 	puts("GT");
 	testPowVec(e);
+	CYBOZU_TEST_ASSERT(mcl::bn::isValidGT(e));
+	GT e2 = e;
+	e2 += 1;
+	CYBOZU_TEST_ASSERT(!mcl::bn::isValidGT(e2));
 }

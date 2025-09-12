@@ -1,4 +1,5 @@
 package bls
+
 /*
 #cgo CFLAGS:-I${SRCDIR}./include -DBLS_ETH
 #include <mcl/bn_c384_256.h>
@@ -122,17 +123,6 @@ func (sig *Sign) DeserializeUncompressed(buf []byte) error {
 	err := C.blsSignatureDeserializeUncompressed(&sig.v, unsafe.Pointer(&buf[0]), C.mclSize(len(buf)))
 	if err == 0 {
 		return fmt.Errorf("err blsSignatureDeserializeUncompressed %x", buf)
-	}
-	return nil
-}
-
-// SetETHmode --
-// 0 ; old version
-// 1 ; draft 05
-// 2 ; draft 06
-func SetETHmode(mode int) error {
-	if err := C.blsSetETHmode(C.int(mode)); err != 0 {
-		return fmt.Errorf("got non-zero response code: %d", err)
 	}
 	return nil
 }

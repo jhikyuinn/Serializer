@@ -18,17 +18,17 @@
 	#define MCLBN_COMPILED_TIME_VAR ((MCLBN_FR_UNIT_SIZE) * 10 + (MCLBN_FP_UNIT_SIZE) + BLS_COMPILER_TIME_VAR_ADJ)
 #endif
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 	#ifdef BLS_DONT_EXPORT
 		#define BLS_DLL_API
 	#else
 		#ifdef BLS_DLL_EXPORT
 			#define BLS_DLL_API __declspec(dllexport)
 		#else
-			#define BLS_DLL_API __declspec(dllimport)
+			#define BLS_DLL_API //__declspec(dllimport)
 		#endif
 	#endif
-	#ifndef BLS_NO_AUTOLINK
+	#if defined(_MSC_VER) && !defined(BLS_NO_AUTOLINK)
 		#if MCLBN_FP_UNIT_SIZE == 4
 			#pragma comment(lib, "bls256.lib")
 		#elif (MCLBN_FP_UNIT_SIZE == 6) && (MCLBN_FR_UNIT_SIZE == 4)
@@ -141,16 +141,18 @@ BLS_DLL_API int blsVerify(const blsSignature *sig, const blsPublicKey *pub, cons
 	pubVec[i] *= randVec[i]
 	return blsAggregateVerifyNoCheck(sig, pubVec, msgVec, msgSize, n);
 	@remark return 0 if some pubVec[i] is zero
+	sigVec may be normalized
 */
-BLS_DLL_API int blsMultiVerify(const blsSignature *sigVec, const blsPublicKey *pubVec, const void *msgVec, mclSize msgSize, const void *randVec, mclSize randSize, mclSize n, int threadN);
+BLS_DLL_API int blsMultiVerify(blsSignature *sigVec, const blsPublicKey *pubVec, const void *msgVec, mclSize msgSize, const void *randVec, mclSize randSize, mclSize n, int threadN);
 
 /*
 	subroutine of blsMultiVerify
 	e = prod_i millerLoop(pubVec[i] * randVec[i], Hash(msgVec[i]))
 	aggSig = sum_i sigVec[i] * randVec[i]
 	@remark set *e = 0 if some pubVec[i] is zero
+	sigVec may be normalized
 */
-BLS_DLL_API void blsMultiVerifySub(mclBnGT *e, blsSignature *aggSig, const blsSignature *sigVec, const blsPublicKey *pubVec, const char *msg, mclSize msgSize, const char *randVec, mclSize randSize, mclSize n);
+BLS_DLL_API void blsMultiVerifySub(mclBnGT *e, blsSignature *aggSig, blsSignature *sigVec, const blsPublicKey *pubVec, const char *msg, mclSize msgSize, const char *randVec, mclSize randSize, mclSize n);
 
 /*
 	subroutine of blsMultiVerify
@@ -218,7 +220,7 @@ BLS_DLL_API void blsSignatureAdd(blsSignature *sig, const blsSignature *rhs);
 
 /*
 	verify whether a point of an elliptic curve has order r
-	This api affetcs setStr(), deserialize() for G2 on BN or G1/G2 on BLS12
+	This api affects setStr(), deserialize() for G2 on BN or G1/G2 on BLS12
 	@param doVerify [in] does not verify if zero(default 1)
 	Signature = G1, PublicKey = G2
 */
@@ -283,8 +285,9 @@ BLS_DLL_API void blsSecretKeyMul(blsSecretKey *y, const blsSecretKey *x);
 BLS_DLL_API void blsPublicKeyMul(blsPublicKey *y, const blsSecretKey *x);
 BLS_DLL_API void blsSignatureMul(blsSignature *y, const blsSecretKey *x);
 
-BLS_DLL_API void blsPublicKeyMulVec(blsPublicKey *z, const blsPublicKey *x, const blsSecretKey *y, mclSize n);
-BLS_DLL_API void blsSignatureMulVec(blsSignature *z, const blsSignature *x, const blsSecretKey *y, mclSize n);
+// x may be normalized, so it is not a const pointer
+BLS_DLL_API void blsPublicKeyMulVec(blsPublicKey *z, blsPublicKey *x, const blsSecretKey *y, mclSize n);
+BLS_DLL_API void blsSignatureMulVec(blsSignature *z, blsSignature *x, const blsSecretKey *y, mclSize n);
 
 // not thread safe version (old blsInit)
 BLS_DLL_API int blsInitNotThreadSafe(int curve, int compiledTimeVar);
@@ -386,7 +389,7 @@ BLS_DLL_API void blsDHKeyExchange(blsPublicKey *out, const blsSecretKey *sec, co
 	https://crypto.stanford.edu/~dabo/pubs/papers/BLSmultisig.html
 	H(pubVec)_i := SHA-256(pubVec[0], ..., pubVec[n-1], 4-byte little endian(i))
 	@note
-	1. this hash function will be modifed in the future
+	1. this hash function will be modified in the future
 	2. sigVec and pubVec are not const because they may be normalized (the value are not changed)
 */
 // aggSig = sum sigVec[i] t_i where (t_1, ..., t_n) = H({pubVec})

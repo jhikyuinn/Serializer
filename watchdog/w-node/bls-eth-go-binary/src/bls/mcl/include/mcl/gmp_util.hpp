@@ -6,16 +6,13 @@
 	@license modified new BSD license
 	http://opensource.org/licenses/BSD-3-Clause
 */
-#include <stdio.h>
-#include <stdlib.h>
+#include <mcl/config.hpp>
 #include <assert.h>
-#include <stdint.h>
 #include <cybozu/bit_operation.hpp>
 #ifndef CYBOZU_DONT_USE_EXCEPTION
 #include <cybozu/exception.hpp>
 #endif
 #include <mcl/randgen.hpp>
-#include <mcl/config.hpp>
 #include <mcl/conversion.hpp>
 
 #ifdef _MSC_VER
@@ -35,9 +32,13 @@
 typedef mcl::Vint mpz_class;
 #else
 #include <gmpxx.h>
+#include <mcl/bint.hpp>
 #ifdef _MSC_VER
 	#pragma warning(pop)
 	#include <cybozu/link_mpir.hpp>
+#endif
+#if MCL_SIZEOF_UNIT == 8 && (defined(_LONG_LONG_LIMB) || defined(__APPLE__))
+	#define MCL_GMP_CANT_USE_UINT
 #endif
 #endif
 
@@ -67,17 +68,21 @@ template<class T>
 void getArray(bool *pb, T *buf, size_t maxSize, const mpz_class& x)
 {
 #ifdef MCL_USE_VINT
-	const fp::Unit *src = x.getUnit();
+	if (x.isNegative()) {
+		*pb = false;
+		return;
+	}
+	const Unit *src = x.getUnit();
 	const size_t n = x.getUnitSize();
-	*pb = fp::convertArrayAsLE(buf, maxSize, src, n);
 #else
 	int n = x.get_mpz_t()->_mp_size;
 	if (n < 0) {
 		*pb = false;
 		return;
 	}
-	*pb = fp::convertArrayAsLE(buf, maxSize, x.get_mpz_t()->_mp_d, n);
+	const Unit *src = (const Unit*)x.get_mpz_t()->_mp_d;
 #endif
+	*pb = fp::convertArrayAsLE(buf, maxSize, src, n);
 }
 inline void set(mpz_class& z, uint64_t x)
 {
@@ -86,6 +91,28 @@ inline void set(mpz_class& z, uint64_t x)
 	assert(b);
 	(void)b;
 }
+// z = x
+inline void setUnit(mpz_class& z, Unit x)
+{
+#ifdef MCL_GMP_CANT_USE_UINT
+	set(z, x);
+#else
+	z = x;
+#endif
+}
+
+// z += x
+inline void addUnit(mpz_class& z, Unit x)
+{
+#ifdef MCL_GMP_CANT_USE_UINT
+	mpz_class t;
+	setUnit(t, x);
+	z += t;
+#else
+	z += x;
+#endif
+}
+
 inline void setStr(bool *pb, mpz_class& z, const char *str, int base = 0)
 {
 #ifdef MCL_USE_VINT
@@ -392,15 +419,15 @@ inline void setBit(mpz_class& x, size_t pos, bool v = true)
 	}
 #endif
 }
-inline const fp::Unit *getUnit(const mpz_class& x)
+inline const Unit *getUnit(const mpz_class& x)
 {
 #ifdef MCL_USE_VINT
 	return x.getUnit();
 #else
-	return reinterpret_cast<const fp::Unit*>(x.get_mpz_t()->_mp_d);
+	return reinterpret_cast<const Unit*>(x.get_mpz_t()->_mp_d);
 #endif
 }
-inline fp::Unit getUnit(const mpz_class& x, size_t i)
+inline Unit getUnit(const mpz_class& x, size_t i)
 {
 	return getUnit(x)[i];
 }
@@ -483,6 +510,7 @@ inline void getRandPrime(bool *pb, mpz_class& z, size_t bitSize, fp::RandGen rg 
 	for (;;) {
 		getRand(pb, z, bitSize, rg);
 		if (!*pb) return;
+		z |= 1; // odd
 		if (setSecondBit) {
 			z |= mpz_class(1) << (bitSize - 2);
 		}
@@ -528,8 +556,10 @@ size_t getContinuousVal(const Vec& v, size_t pos, int val)
 template<class Vec>
 void convertToNAF(Vec& v, const Vec& in)
 {
+	assert(in.size() > 0);
 	v.copy(in);
 	size_t pos = v.size() - 1;
+	if (pos == 0) return;
 	for (;;) {
 		size_t p = getContinuousVal(v, pos, 0);
 		if (p == 1) return;
@@ -754,6 +784,61 @@ class SquareRoot {
 		}
 		return false;
 	}
+	/*
+		solve x^2 = a in Fp
+	*/
+	template<class Fp>
+	bool getCandidate(Fp& x, const Fp& a) const
+	{
+		assert(Fp::getOp().mp == p);
+		if (a.isZero() || a.isOne()) {
+			x = a;
+			return true;
+		}
+		if (r == 1) {
+			// (p + 1) / 4 = (q + 1) / 2
+			Fp::pow(x, a, q_add_1_div_2);
+			return true;
+		}
+		Fp c, d;
+		{
+			bool b;
+			c.setMpz(&b, s);
+			assert(b);
+		}
+		int e = r;
+		Fp::pow(d, a, q);
+		Fp::pow(x, a, q_add_1_div_2); // destroy a if &x == &a
+		Fp dd;
+		Fp b;
+		while (!d.isOne()) {
+			int i = 1;
+			Fp::sqr(dd, d);
+			while (!dd.isOne()) {
+				Fp::sqr(dd, dd);
+				i++;
+				if (i >= e) return false;
+			}
+			assert(e > i);
+			int t = e - i - 1;
+			const int tMax = 30; // int32_t max
+			if (t < tMax) {
+				b = 1 << t;
+			} else {
+				b = 1 << tMax;
+				t -= tMax;
+				for (int j = 0; j < t; j++) {
+					b += b;
+				}
+			}
+			Fp::pow(b, c, b);
+			x *= b;
+			Fp::sqr(c, b);
+			d *= c;
+			e = i;
+		}
+		return true;
+	}
 public:
 	SquareRoot() { clear(); }
 	bool isPrecomputed() const { return isPrecomputed_; }
@@ -808,100 +893,18 @@ public:
 		q_add_1_div_2 = (q + 1) / 2;
 		*pb = true;
 	}
-	/*
-		solve x^2 = a mod p
-	*/
-	bool get(mpz_class& x, const mpz_class& a) const
+	template<class T>
+	bool get(T& x, const T& a) const
 	{
-		if (!isPrime) {
-			return false;
-		}
-		if (a == 0) {
-			x = 0;
-			return true;
-		}
-		if (gmp::legendre(a, p) < 0) return false;
-		if (r == 1) {
-			// (p + 1) / 4 = (q + 1) / 2
-			gmp::powMod(x, a, q_add_1_div_2, p);
-			return true;
-		}
-		mpz_class c = s, d;
-		int e = r;
-		gmp::powMod(d, a, q, p);
-		gmp::powMod(x, a, q_add_1_div_2, p); // destroy a if &x == &a
-		mpz_class dd;
-		mpz_class b;
-		while (d != 1) {
-			int i = 1;
-			dd = d * d; dd %= p;
-			while (dd != 1) {
-				dd *= dd; dd %= p;
-				i++;
+		T t, t2;
+		if (getCandidate(t, a)) {
+			T::sqr(t2, t);
+			if (t2 == a) {
+				x = t;
+				return true;
 			}
-			b = 1;
-			b <<= e - i - 1;
-			gmp::powMod(b, c, b, p);
-			x *= b; x %= p;
-			c = b * b; c %= p;
-			d *= c; d %= p;
-			e = i;
 		}
-		return true;
-	}
-	/*
-		solve x^2 = a in Fp
-	*/
-	template<class Fp>
-	bool get(Fp& x, const Fp& a) const
-	{
-		assert(Fp::getOp().mp == p);
-		if (a == 0) {
-			x = 0;
-			return true;
-		}
-		{
-			bool b;
-			mpz_class aa;
-			a.getMpz(&b, aa);
-			assert(b);
-			if (gmp::legendre(aa, p) < 0) return false;
-		}
-		if (r == 1) {
-			// (p + 1) / 4 = (q + 1) / 2
-			Fp::pow(x, a, q_add_1_div_2);
-			return true;
-		}
-		Fp c, d;
-		{
-			bool b;
-			c.setMpz(&b, s);
-			assert(b);
-		}
-		int e = r;
-		Fp::pow(d, a, q);
-		Fp::pow(x, a, q_add_1_div_2); // destroy a if &x == &a
-		Fp dd;
-		Fp b;
-		while (!d.isOne()) {
-			int i = 1;
-			Fp::sqr(dd, d);
-			while (!dd.isOne()) {
-				dd *= dd;
-				i++;
-			}
-			b = 1;
-//			b <<= e - i - 1;
-			for (int j = 0; j < e - i - 1; j++) {
-				b += b;
-			}
-			Fp::pow(b, c, b);
-			x *= b;
-			Fp::sqr(c, b);
-			d *= c;
-			e = i;
-		}
-		return true;
+		return false;
 	}
 	bool operator==(const SquareRoot& rhs) const
 	{
@@ -920,92 +923,12 @@ public:
 };
 
 /*
-	x mod p for a small value x < (pMulTblN * p).
-*/
-struct SmallModp {
-	typedef mcl::fp::Unit Unit;
-	static const size_t unitBitSize = sizeof(Unit) * 8;
-	static const size_t maxTblSize = (MCL_MAX_BIT_SIZE + unitBitSize - 1) / unitBitSize + 1;
-	static const size_t maxMulN = 9;
-	static const size_t pMulTblN = maxMulN + 1;
-	uint32_t N_;
-	uint32_t shiftL_;
-	uint32_t shiftR_;
-	uint32_t maxIdx_;
-	// pMulTbl_[i] = (p * i) >> (pBitSize_ - 1)
-	Unit pMulTbl_[pMulTblN][maxTblSize];
-	// idxTbl_[x] = (x << (pBitSize_ - 1)) / p
-	uint8_t idxTbl_[pMulTblN * 2];
-	// return x >> (pBitSize_ - 1)
-	SmallModp()
-		: N_(0)
-		, shiftL_(0)
-		, shiftR_(0)
-		, maxIdx_(0)
-		, pMulTbl_()
-		, idxTbl_()
-	{
-	}
-	// return argmax { i : x > i * p }
-	uint32_t approxMul(const Unit *x) const
-	{
-		uint32_t top = getTop(x);
-		assert(top <= maxIdx_);
-		return idxTbl_[top];
-	}
-	const Unit *getPmul(size_t v) const
-	{
-		assert(v < pMulTblN);
-		return pMulTbl_[v];
-	}
-	uint32_t getTop(const Unit *x) const
-	{
-		if (shiftR_ == 0) return x[N_ - 1];
-		return (x[N_ - 1] >> shiftR_) | (x[N_] << shiftL_);
-	}
-	uint32_t cvtInt(const mpz_class& x) const
-	{
-		assert(mcl::gmp::getUnitSize(x) <= 1);
-		if (x == 0) {
-			return 0;
-		} else {
-			return uint32_t(mcl::gmp::getUnit(x)[0]);
-		}
-	}
-	void init(const mpz_class& p)
-	{
-		size_t pBitSize = mcl::gmp::getBitSize(p);
-		N_ = uint32_t((pBitSize + unitBitSize - 1) / unitBitSize);
-		shiftR_ = (pBitSize - 1) % unitBitSize;
-		shiftL_ = unitBitSize - shiftR_;
-		mpz_class t = 0;
-		for (size_t i = 0; i < pMulTblN; i++) {
-			bool b;
-			mcl::gmp::getArray(&b, pMulTbl_[i], maxTblSize, t);
-			assert(b);
-			(void)b;
-			if (i == pMulTblN - 1) {
-				maxIdx_ = getTop(pMulTbl_[i]);
-				assert(maxIdx_ < CYBOZU_NUM_OF_ARRAY(idxTbl_));
-				break;
-			}
-			t += p;
-		}
-
-		for (uint32_t i = 0; i <= maxIdx_; i++) {
-			idxTbl_[i] = cvtInt((mpz_class(int(i)) << (pBitSize - 1)) / p);
-		}
-	}
-};
-
-
-/*
 	Barrett Reduction
 	for non GMP version
 	mod of GMP is faster than Modp
 */
 struct Modp {
-	static const size_t unitBitSize = sizeof(mcl::fp::Unit) * 8;
+	static const size_t unitBitSize = sizeof(mcl::Unit) * 8;
 	mpz_class p_;
 	mpz_class u_;
 	mpz_class a_;
@@ -1056,6 +979,10 @@ struct Modp {
 	}
 	void modp(mpz_class& r, const mpz_class& t) const
 	{
+		if (t < p_) {
+			r = t;
+			return;
+		}
 		assert(p_ > 0);
 		const size_t tBitSize = gmp::getBitSize(t);
 		// use gmp::mod if init() fails or t is too large

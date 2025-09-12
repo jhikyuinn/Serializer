@@ -1,3 +1,4 @@
+#define MCL_DONT_CALL_INITBINT
 #include "llvm_gen.hpp"
 #include <cybozu/option.hpp>
 #include <mcl/op.hpp>
@@ -52,17 +53,27 @@ struct Code : public mcl::Generator {
 		if (offset > 0) {
 			p = getelementptr(p, offset);
 		}
+#if 1
+		const size_t n = r.bit / unit;
+		if (n > 1) {
+			p = bitcast(p, Operand(IntPtr, unit * n));
+		}
+		store(r, p);
+#else
 		if (r.bit == unit) {
 			store(r, p);
 			return;
 		}
 		const size_t n = r.bit / unit;
 		for (uint32_t i = 0; i < n; i++) {
-			store(trunc(r, unit), getelementptr(p, i));
+			Operand pp = getelementptr(p, i);
+			Operand t = trunc(r, unit);
+			store(t, pp);
 			if (i < n - 1) {
 				r = lshr(r, unit);
 			}
 		}
+#endif
 	}
 	Operand loadN(Operand p, size_t n, int offset = 0)
 	{
@@ -72,6 +83,12 @@ struct Code : public mcl::Generator {
 		if (offset > 0) {
 			p = getelementptr(p, offset);
 		}
+#if 1
+		if (n > 1) {
+			p = bitcast(p, Operand(IntPtr, unit * n));
+		}
+		return load(p);
+#else
 		Operand v = load(p);
 		for (uint32_t i = 1; i < n; i++) {
 			v = zext(v, v.bit + unit);
@@ -81,6 +98,7 @@ struct Code : public mcl::Generator {
 			v = _or(v, t);
 		}
 		return v;
+#endif
 	}
 	void gen_mul32x32()
 	{
@@ -428,7 +446,8 @@ struct Code : public mcl::Generator {
 		} else {
 			z = sub(x, y);
 			storeN(trunc(z, bit), pz);
-			r = _and(trunc(lshr(z, bit), unit), makeImm(unit, 1));
+			Operand one = makeImm(unit, 1);
+			r = _and(trunc(lshr(z, bit), unit), one);
 		}
 		ret(r);
 		endFunc();
@@ -500,21 +519,14 @@ struct Code : public mcl::Generator {
 		if (isFullBit) {
 			x = zext(x, bit + unit);
 			y = zext(y, bit + unit);
-			Operand t0 = add(x, y);
-			Operand t1 = trunc(t0, bit);
-			storeN(t1, pz);
+			x = add(x, y);
 			Operand p = loadN(pp, N);
 			p = zext(p, bit + unit);
-			Operand vc = sub(t0, p);
-			Operand c = lshr(vc, bit);
-			c = trunc(c, 1);
-		Label carry("carry");
-		Label nocarry("nocarry");
-			br(c, carry, nocarry);
-		putLabel(nocarry);
-			storeN(trunc(vc, bit), pz);
-			ret(Void);
-		putLabel(carry);
+			y = sub(x, p);
+			Operand c = trunc(lshr(y, bit), 1);
+			x = select(c, x, y);
+			x = trunc(x, bit);
+			storeN(x, pz);
 		} else {
 			x = add(x, y);
 			Operand p = loadN(pp, N);
@@ -544,32 +556,21 @@ struct Code : public mcl::Generator {
 		Operand x = loadN(px, N);
 		Operand y = loadN(py, N);
 		if (isFullBit) {
-			x = zext(x, bit + unit);
-			y = zext(y, bit + unit);
-			Operand vc = sub(x, y);
-			Operand v, c;
-			v = trunc(vc, bit);
-			c = lshr(vc, bit);
-			c = trunc(c, 1);
-			storeN(v, pz);
-		Label carry("carry");
-		Label nocarry("nocarry");
-			br(c, carry, nocarry);
-		putLabel(nocarry);
-			ret(Void);
-		putLabel(carry);
-			Operand p = loadN(pp, N);
-			Operand t = add(v, p);
-			storeN(t, pz);
-		} else {
-			Operand v = sub(x, y);
-			Operand c;
-			c = trunc(lshr(v, bit - 1), 1);
-			Operand p = loadN(pp, N);
-			c = select(c, p, makeImm(bit, 0));
-			Operand t = add(v, c);
-			storeN(t, pz);
+			x = zext(x, bit + 1);
+			y = zext(y, bit + 1);
 		}
+		Operand v = sub(x, y);
+		Operand c;
+		if (isFullBit) {
+			c = trunc(lshr(v, bit), 1);
+			v = trunc(v, bit);
+		} else {
+			c = trunc(lshr(v, bit - 1), 1);
+		}
+		Operand p = loadN(pp, N);
+		c = select(c, p, makeImm(bit, 0));
+		v = add(v, c);
+		storeN(v, pz);
 		ret(Void);
 		endFunc();
 	}
@@ -947,7 +948,7 @@ struct Code : public mcl::Generator {
 		Operand z;
 		if (isFullBit) {
 			p = zext(p, bu);
-			t = zext(t, bu);
+			t = pack(H, t);
 			Operand vc = sub(t, p);
 			Operand c = trunc(lshr(vc, bit), 1);
 			z = select(c, t, vc);
@@ -979,9 +980,11 @@ struct Code : public mcl::Generator {
 	void gen_mul()
 	{
 		gen_mulPv();
-		gen_mcl_fp_mulUnitPre();
-		gen_mcl_fpDbl_mulPre();
-		gen_mcl_fpDbl_sqrPre();
+//		gen_mcl_fp_mulUnitPre();
+		if (bit == 192) {
+			gen_mcl_fpDbl_mulPre();
+			gen_mcl_fpDbl_sqrPre();
+		}
 		gen_mcl_fp_mont(true);
 		gen_mcl_fp_mont(false);
 		gen_mcl_fp_montRed(true);

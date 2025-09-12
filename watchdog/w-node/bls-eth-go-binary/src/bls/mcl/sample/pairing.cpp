@@ -10,7 +10,7 @@ void minimum_sample(const G1& P, const G2& Q)
 	pairing(e1, P, Q);
 	G2 aQ;
 	G1 bP;
-	a.setHashOf("abc");
+	a.setHashOf("abc", 3);
 	printf("a = %s\n", a.getStr(16).c_str());
 	printf("a - b = %s\n", (a - b).getStr(16).c_str());
 	G2::mul(aQ, Q, a);
@@ -43,13 +43,14 @@ void precomputed(const G1& P, const G2& Q)
 }
 
 int main(int argc, char *[])
+	try
 {
 	if (argc == 1) {
-		initPairing(mcl::BLS12_381);
 		puts("BLS12_381");
+		initPairing(mcl::BLS12_381);
 	} else {
-		initPairing(mcl::BN254);//, mcl::fp::FP_GMP);
 		puts("BN254");
+		initPairing(mcl::BN254);//, mcl::fp::FP_GMP);
 	}
 	G1 P;
 	G2 Q;
@@ -61,5 +62,7 @@ int main(int argc, char *[])
 	minimum_sample(P, Q);
 	miller_and_finel_exp(P, Q);
 	precomputed(P, Q);
+} catch (std::exception& e) {
+	printf("ERR %s\n", e.what());
+	return 1;
 }
-

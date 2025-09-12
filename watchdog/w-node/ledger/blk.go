@@ -105,7 +105,7 @@ func UserAbortInfoInsert(cMsg *pb.AuditMsg) {
 		{"LeaderID", cMsg.LeaderID},
 		{"MerkleRootHash", cMsg.MerkleRootHash},
 		{"Signature", cMsg.Signature},
-		{"NumofAbortTransaction", cMsg.AbortTransactionNum},
+		{"NumofAbortTransaction", cMsg.Aborttransactionnum},
 		{"Committee", cMsg.HonestAuditors},
 	})
 	if err != nil {

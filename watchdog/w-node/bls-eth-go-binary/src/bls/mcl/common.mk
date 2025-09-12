@@ -1,5 +1,5 @@
 GCC_VER=$(shell $(PRE)$(CC) -dumpversion)
-UNAME_S=$(shell uname -s)
+UNAME_S?=$(shell uname -s)
 ARCH?=$(shell uname -m)
 NASM_ELF_OPT=-felf64
 ifeq ($(UNAME_S),Linux)
@@ -48,7 +48,7 @@ ifneq ($(findstring $(ARCH),x86_64/amd64),)
   #LOW_ASM_SRC=src/asm/low_x86-64.asm
   #ASM=nasm -felf64
 endif
-ifeq ($(ARCH),x86)
+ifneq ($(findstring $(ARCH),x86/i386/i686),)
   CPU=x86
   INTEL=1
   BIT=32
@@ -73,26 +73,39 @@ ifeq ($(ARCH),s390x)
   BIT=64
 endif
 
+AR?=ar
+ARFLAGS?=r
 CP=cp -f
-AR=ar r
 MKDIR=mkdir -p
 RM=rm -rf
 
+DEBUG?=0
 ifeq ($(DEBUG),1)
   ifeq ($(GCC_EXT),1)
-    CFLAGS+=-fsanitize=address
-    LDFLAGS+=-fsanitize=address
+    SANITIZE_OPT?=-fsanitize=address
   endif
-else
+endif
+ifeq ($(DEBUG),2)
+  ifeq ($(GCC_EXT),1)
+    SANITIZE_OPT?=-fsanitize=memory -fsanitize-memory-track-origins=2
+  endif
+endif
+ifeq ($(DEBUG),3)
+  # no option
+endif
+ifeq ($(DEBUG),4)
+  ifeq ($(GCC_EXT),1)
+    SANITIZE_OPT?=-fsanitize=undefined -fno-sanitize-recover
+  endif
+endif
+CFLAGS+=$(SANITIZE_OPT)
+LDFLAGS+=$(SANITIZE_OPT)
+ifeq ($(DEBUG),0)
   CFLAGS_OPT+=-fomit-frame-pointer -DNDEBUG -fno-stack-protector
   ifeq ($(CXX),clang++)
     CFLAGS_OPT+=-O3
   else
-    ifeq ($(shell expr $(GCC_VER) \> 4.6.0),1)
-      CFLAGS_OPT+=-O3
-    else
-      CFLAGS_OPT+=-O3
-    endif
+    CFLAGS_OPT+=-O3
   endif
   ifeq ($(MARCH),)
     ifeq ($(INTEL),1)
@@ -112,42 +125,44 @@ ifeq ($(DEBUG),0)
 CFLAGS+=$(CFLAGS_OPT_USER)
 endif
 CFLAGS+=$(CFLAGS_USER)
-MCL_USE_GMP?=1
-ifneq ($(OS),mac/mac-m1,)
-  MCL_USE_GMP=0
-endif
-MCL_USE_OPENSSL?=0
-ifeq ($(MCL_USE_GMP),0)
-  CFLAGS+=-DMCL_USE_VINT
-endif
 ifneq ($(MCL_SIZEOF_UNIT),)
   CFLAGS+=-DMCL_SIZEOF_UNIT=$(MCL_SIZEOF_UNIT)
 endif
-ifeq ($(MCL_USE_OPENSSL),0)
-  CFLAGS+=-DMCL_DONT_USE_OPENSSL
-endif
+MCL_USE_GMP?=0
 ifeq ($(MCL_USE_GMP),1)
+  CFLAGS+=-DMCL_USE_GMP=1
+  MCL_USE_GMP_LIB=1
+endif
+MCL_USE_GMP_LIB?=1
+ifeq ($(MCL_USE_GMP_LIB),1)
   GMP_LIB=-lgmp -lgmpxx
   ifeq ($(UNAME_S),Darwin)
-    GMP_DIR?=/usr/local/opt/gmp
+    GMP_DIR?=/opt/homebrew/
+  endif
+  ifneq ($(GMP_DIR),)
     CFLAGS+=-I$(GMP_DIR)/include
     LDFLAGS+=-L$(GMP_DIR)/lib
-  endif
-endif
-ifeq ($(MCL_USE_OPENSSL),1)
-  OPENSSL_LIB=-lcrypto
-  ifeq ($(UNAME_S),Darwin)
-    OPENSSL_DIR?=/usr/local/opt/openssl
-    CFLAGS+=-I$(OPENSSL_DIR)/include
-    LDFLAGS+=-L$(OPENSSL_DIR)/lib
   endif
 endif
 ifeq ($(MCL_STATIC_CODE),1)
   MCL_USE_XBYAK=0
   MCL_MAX_BIT_SIZE=384
   CFLAGS+=-DMCL_STATIC_CODE
+  CFLAGS+=-fno-exceptions -fno-rtti -DCYBOZU_DONT_USE_STRING -DCYBOZU_DONT_USE_EXCEPTION
 endif
-LDFLAGS+=$(GMP_LIB) $(OPENSSL_LIB) $(BIT_OPT) $(LDFLAGS_USER)
+ifeq ($(MCL_USE_OMP),1)
+  CFLAGS+=-DMCL_USE_OMP
+  ifneq ($(findstring $(OS),mac/mac-m1),)
+    CFLAGS+=-Xpreprocessor -fopenmp
+    LDFLAGS+=-lomp
+  else
+    CFLAGS+=-fopenmp
+    LDFLAGS+=-fopenmp
+  endif
+endif
+LDFLAGS+=$(GMP_LIB) $(BIT_OPT) $(LDFLAGS_USER)
 
-CFLAGS+=-fPIC
+# -fpic is better than -fPIC in exchange for restriction of a size of GOT
+# https://tldp.org/HOWTO/Program-Library-HOWTO/shared-libraries.html
+CFLAGS+=-fpic
 

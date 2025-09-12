@@ -11,6 +11,8 @@ const (
 	NODE_INFO_PACKET      = 18
 	PATH_INFO_PACKET      = 19
 	PATH_INFO_ACK_PACKET  = 20
+	AUDIT_MSG_PACKET      = 21
+	AUDIT_MSG_ACK_PACKET  = 22
 	PACKET_SIZE           = 1460 // maximum packet size (header + payload)
 	PAYLOAD_SIZE          = 1024 // 1KB = SYMBOL SIZE, Block Data Size
 )

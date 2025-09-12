@@ -92,7 +92,6 @@ func ConnHandler(conn net.Conn) {
 	}
 }
 
-// 이건 왜있지.
 func nodeExist(id string) bool {
 	for _, mem := range msp.Membership.Nodes {
 		if mem.NodeID == id {
@@ -102,7 +101,6 @@ func nodeExist(id string) bool {
 	return false
 }
 
-// 이건 왜있지.
 func FabricHandler(conn net.Conn) {
 	recvBuf := make([]byte, 8192)
 
@@ -133,6 +131,8 @@ type NodeMeta struct {
 	LastSeen time.Time
 }
 
+const nodeTimeout = 10 * time.Second
+
 var NodeMetaMap = make(map[string]*NodeMeta)
 
 func UpdateNode(node *pb.Node) {
@@ -141,42 +141,41 @@ func UpdateNode(node *pb.Node) {
 
 	for i := range msp.Membership.Nodes {
 		if msp.Membership.Nodes[i].NodeID == node.NodeID {
-			msp.Membership.Nodes[i].Alive = true
-			if meta, ok := NodeMetaMap[node.NodeID]; ok {
-				meta.LastSeen = time.Now()
-			} else {
-				NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: time.Now()}
-			}
+			NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: time.Now()}
 			return
+		} else {
+			fmt.Println("HELLO")
 		}
 	}
 
-	node.Alive = true
 	msp.Membership.Nodes = append(msp.Membership.Nodes, node)
 	NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: time.Now()}
-
 	fmt.Println("🆕 새로운 노드 추가:", node.NodeID)
 }
+
+func IsNodeAlive(nodeID string) bool {
+	meta, ok := NodeMetaMap[nodeID]
+	if !ok {
+		return false
+	}
+	return time.Since(meta.LastSeen) <= nodeTimeout
+}
+
 func RemoveDeadNodes() {
 	for {
 		time.Sleep(time.Second * 10)
 
 		msp.RwM.Lock()
-		now := time.Now()
-		var aliveNodes []*pb.Node
-
+		active := make([]*pb.Node, 0)
 		for _, node := range msp.Membership.Nodes {
-			meta, ok := NodeMetaMap[node.NodeID]
-			fmt.Println(now.Sub(meta.LastSeen))
-			if ok && now.Sub(meta.LastSeen) <= 13*time.Second {
-				aliveNodes = append(aliveNodes, node)
+			if IsNodeAlive(node.NodeID) {
+				active = append(active, node)
 			} else {
+				fmt.Println("🗑️ 오래된 노드 제거:", node.NodeID)
 				delete(NodeMetaMap, node.NodeID)
 			}
 		}
-
-		fmt.Println("🧹 살아있는 노드 수:", len(aliveNodes))
-		msp.Membership.Nodes = aliveNodes
+		msp.Membership.Nodes = active
 		msp.RwM.Unlock()
 	}
 }
@@ -190,10 +189,12 @@ func (s *server) GetMembership(ctx context.Context, msg *pb.MemberMsg) (*pb.Memb
 	node := &pb.Node{
 		NodeID:    msg.Nodes[0].NodeID,
 		Addr:      msg.Nodes[0].Addr,
+		Port:      msg.Nodes[0].Port,
 		Publickey: msg.Nodes[0].Publickey,
-		Channel:   msg.Nodes[0].Channel,
+		Seed:      msg.Nodes[0].Seed,
+		Proof:     msg.Nodes[0].Proof,
+		Value:     msg.Nodes[0].Value,
 	}
-
 	UpdateNode(node)
 
 	msp.RwM.RLock()

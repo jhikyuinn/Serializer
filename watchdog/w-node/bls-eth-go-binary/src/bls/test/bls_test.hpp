@@ -2,6 +2,7 @@
 #include <cybozu/test.hpp>
 #include <cybozu/inttype.hpp>
 #include <cybozu/benchmark.hpp>
+#include <mcl/config.hpp>
 #include <cybozu/sha2.hpp>
 #include <cybozu/atoi.hpp>
 #include <cybozu/file.hpp>
@@ -730,7 +731,7 @@ void blsAggregateVerifyNoCheckTestOne(size_t n, bool hasZero = false)
 			sec.clear();
 		}
 		sec.getPublicKey(pubs[i]);
-		msgs[msgSize * i] = i;
+		msgs[msgSize * i] = char(i);
 		sec.sign(sigs[i], &msgs[msgSize * i], msgSize);
 	}
 	blsSignature aggSig;
@@ -900,7 +901,7 @@ void ethMultiVerifyTestOne(size_t n)
 	for (size_t i = 0; i < n; i++) {
 		bls::SecretKey sec;
 		sec.init();
-		sec.signHash(sigs[i], &msgs[i * msgSize], msgSize);
+		sec.sign(sigs[i], &msgs[i * msgSize], msgSize);
 		sec.getPublicKey(pubs[i]);
 	}
 #ifndef DISABLE_THREAD_TEST
@@ -937,7 +938,7 @@ void ethMultiVerifyZeroTest()
 		} else {
 			sec.init();
 		}
-		sec.signHash(sigs[i], &msgs[i * msgSize], msgSize);
+		sec.sign(sigs[i], &msgs[i * msgSize], msgSize);
 		sec.getPublicKey(pubs[i]);
 	}
 #ifndef DISABLE_THREAD_TEST
@@ -1067,6 +1068,11 @@ void testAll(int type)
 }
 CYBOZU_TEST_AUTO(all)
 {
+#ifdef BLS_ETH
+	puts("BLS_ETH is defined");
+#else
+	puts("BLS_ETH is undefined");
+#endif
 	const struct {
 		int type;
 		const char *name;

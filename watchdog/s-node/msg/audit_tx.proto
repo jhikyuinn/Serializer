@@ -15,8 +15,7 @@ message auditMsg {
   uint32 blkNum = 1;
   string prevHash = 2;
   string MerkleRootHash = 3;
-  string time = 4;
-  string timeConstant = 5;
+  
   string curHash = 6;
   string leaderID = 7;
   bytes signature = 8;
@@ -38,7 +37,9 @@ message wnode {
   string addr = 2;
   string port = 3;
   bytes publickey = 4;
-  string channel = 5;
+  string seed = 5;
+  bytes proof = 6;
+  bytes value =7;
 }
 
 message shard {

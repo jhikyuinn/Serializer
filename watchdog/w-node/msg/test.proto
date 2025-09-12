@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package committee;
+option go_package = "./";
+import "google/protobuf/empty.proto";
+
+service CommitteeService {
+  
+  // 노드 등록 (합의노드 --> 서버 요청)
+  rpc Join(JoinRequest) returns (stream CommitteeInfo){}
+
+  // 커미티 구성 (합의노드 --> 서버 요청)
+  rpc RequestCommittee(CommitteeRequest) returns (google.protobuf.Empty){}
+
+}
+
+// Join 요청
+message JoinRequest {
+  string node_id = 1;            // 참여 노드의 고유 ID
+  string addr = 2;               // 네트워크 주소
+  string port = 3;               // 노드 리스닝 포트
+  string publickey = 4;          // 노드 공개키         
+}
+
+// 커미티 정보 (Join 이후 스트리밍으로 내려옴)
+message CommitteeInfo {
+  string channel_id = 1;          // 커미티 구성한 패브릭 채널 이름
+  repeated string member_ids = 2; // 커미티 멤버 ID 목록
+  string leader_member_id = 3;    // 커미티 리더 멤버 ID
+  string timestamp = 4;           // 구성 시각
+}
+
+// 구성 요청
+message CommitteeRequest {
+  string node_id = 1;            // 참여 노드의 고유 ID
+  string addr = 2;               // 네트워크 주소
+  string port = 3;               // 노드 리스닝 포트
+  string publickey = 4;          // 노드 공개키     
+  string channel   = 5;          // 패브릭 채널 이름
+  bytes seed       = 6;          // VRF에 사용되는 seed
+  bytes proof      = 7;          // 본인의 proof
+}

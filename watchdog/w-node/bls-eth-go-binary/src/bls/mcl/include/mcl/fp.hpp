@@ -6,6 +6,7 @@
 	@license modified new BSD license
 	http://opensource.org/licenses/BSD-3-Clause
 */
+#include <mcl/config.hpp>
 #ifndef CYBOZU_DONT_USE_STRING
 #include <iosfwd>
 #endif
@@ -52,15 +53,6 @@ inline Mode StrToMode(const std::string& s)
 }
 #endif
 
-inline void dumpUnit(Unit x)
-{
-#if MCL_SIZEOF_UNIT == 4
-	printf("%08x", (uint32_t)x);
-#else
-	printf("%016llx", (unsigned long long)x);
-#endif
-}
-
 bool isEnableJIT(); // 1st call is not threadsafe
 
 uint32_t sha256(void *out, uint32_t maxOutSize, const void *msg, uint32_t msgSize);
@@ -85,18 +77,13 @@ inline void byteSwap(uint8_t *x, size_t n)
 template<class tag = FpTag, size_t maxBitSize = MCL_MAX_BIT_SIZE>
 class FpT : public fp::Serializable<FpT<tag, maxBitSize>,
 	fp::Operator<FpT<tag, maxBitSize> > > {
-	typedef fp::Unit Unit;
 	typedef fp::Operator<FpT<tag, maxBitSize> > Operator;
 	typedef fp::Serializable<FpT<tag, maxBitSize>, Operator> Serializer;
 public:
-	static const size_t maxSize = (maxBitSize + fp::UnitBitSize - 1) / fp::UnitBitSize;
+	static const size_t maxSize = (maxBitSize + UnitBitSize - 1) / UnitBitSize;
 private:
-	template<class tag2, size_t maxBitSize2> friend class FpT;
 	Unit v_[maxSize];
 	static fp::Op op_;
-	static FpT<tag, maxBitSize> inv2_;
-	static int ioMode_;
-	static bool isETHserialization_;
 	template<class Fp> friend class FpDblT;
 	template<class Fp> friend class Fp2T;
 	template<class Fp> friend struct Fp6T;
@@ -123,24 +110,10 @@ private:
 	}
 	static inline void mul2A(Unit *y, const Unit *x)
 	{
-		op_.fp_mul2(y, x, op_.p);
+//		op_.fp_mul2(y, x, op_.p);
+		op_.fp_add(y, x, x, op_.p);
 	}
 #endif
-	static inline void mul9A(Unit *y, const Unit *x)
-	{
-		mulSmall(y, x, 9);
-//		op_.fp_mul9(y, x, op_.p);
-	}
-	static inline void mulSmall(Unit *z, const Unit *x, const uint32_t y)
-	{
-		assert(y <= op_.smallModp.maxMulN);
-		Unit xy[maxSize + 1];
-		op_.fp_mulUnitPre(xy, x, y);
-		int v = op_.smallModp.approxMul(xy);
-		const Unit *pv = op_.smallModp.getPmul(v);
-		op_.fp_subPre(z, xy, pv);
-		op_.fp_sub(z, z, op_.p, op_.p);
-	}
 public:
 	typedef FpT<tag, maxBitSize> BaseFp;
 	// return pointer to array v_[]
@@ -155,10 +128,7 @@ public:
 	void dump() const
 	{
 		const size_t N = op_.N;
-		for (size_t i = 0; i < N; i++) {
-			fp::dumpUnit(v_[N - 1 - i]);
-		}
-		printf("\n");
+		bint::dump(v_, N);
 	}
 	/*
 		xi_a is used for Fp2::mul_xi(), where xi = xi_a + i and i^2 = -1
@@ -183,9 +153,6 @@ public:
 			gmp::getArray(pb, op_.half, op_.N, half);
 			if (!*pb) return;
 		}
-		inv(inv2_, 2);
-		ioMode_ = 0;
-		isETHserialization_ = false;
 #ifdef MCL_XBYAK_DIRECT_CALL
 		if (op_.fp_addA_ == 0) {
 			op_.fp_addA_ = addA;
@@ -204,9 +171,6 @@ public:
 		}
 		if (op_.fp_mul2A_ == 0) {
 			op_.fp_mul2A_ = mul2A;
-		}
-		if (op_.fp_mul9A_ == 0) {
-			op_.fp_mul9A_ = mul9A;
 		}
 #endif
 		*pb = true;
@@ -243,15 +207,7 @@ public:
 	}
 	static inline bool squareRoot(FpT& y, const FpT& x)
 	{
-		if (isMont()) return op_.sq.get(y, x);
-		mpz_class mx, my;
-		bool b = false;
-		x.getMpz(&b, mx);
-		if (!b) return false;
-		b = op_.sq.get(my, mx);
-		if (!b) return false;
-		y.setMpz(&b, my);
-		return b;
+		return op_.sq.get(y, x);
 	}
 	FpT() {}
 	FpT(const FpT& x)
@@ -321,7 +277,7 @@ public:
 				readSize = cybozu::readSome(buf, n, is);
 			}
 			if (readSize != n) return;
-			if (isETHserialization_ && ioMode & (IoSerialize | IoSerializeHexStr)) {
+			if ((getETHserialization() || (ioMode & IoBigEndian)) && ioMode & (IoArray | IoSerialize | IoSerializeHexStr)) {
 				fp::local::byteSwap(buf, n);
 			}
 			fp::convertArrayAsLE(v_, op_.N, buf, n);
@@ -333,7 +289,7 @@ public:
 			if (n == 0) return;
 			for (size_t i = n; i < op_.N; i++) v_[i] = 0;
 		}
-		if (fp::isGreaterOrEqualArray(v_, op_.p, op_.N)) {
+		if (bint::cmpGeN(v_, op_.p, op_.N)) {
 			return;
 		}
 		if (isMinus) {
@@ -349,7 +305,7 @@ public:
 	{
 		const size_t n = getByteSize();
 		if (fp::isIoSerializeMode(ioMode)) {
-			const size_t xn = sizeof(fp::Unit) * op_.N;
+			const size_t xn = sizeof(Unit) * op_.N;
 			uint8_t *x = (uint8_t*)CYBOZU_ALLOCA(xn);
 			if (ioMode & IoArrayRaw) {
 				fp::convertArrayAsLE(x, xn, v_, op_.N);
@@ -358,7 +314,7 @@ public:
 				fp::Block b;
 				getBlock(b);
 				fp::convertArrayAsLE(x, xn, b.p, b.n);
-				if (isETHserialization_ && ioMode & (IoSerialize | IoSerializeHexStr)) {
+				if ((getETHserialization() || (ioMode & IoBigEndian)) && ioMode & (IoArray | IoSerialize | IoSerializeHexStr)) {
 					fp::local::byteSwap(x, n);
 				}
 				if (ioMode & IoSerializeHexStr) {
@@ -391,7 +347,7 @@ public:
 			*pb = false;
 			return;
 		}
-		if (fp::isGreaterOrEqualArray(v_, op_.p, op_.N)) {
+		if (bint::cmpGeN(v_, op_.p, op_.N)) {
 			*pb = false;
 			return;
 		}
@@ -406,16 +362,16 @@ public:
 	template<class S>
 	void setArrayMask(const S *x, size_t n)
 	{
-		const size_t dstByte = sizeof(fp::Unit) * op_.N;
+		const size_t dstByte = sizeof(Unit) * op_.N;
 		if (sizeof(S) * n > dstByte) {
 			n = dstByte / sizeof(S);
 		}
 		bool b = fp::convertArrayAsLE(v_, op_.N, x, n);
 		assert(b);
 		(void)b;
-		fp::maskArray(v_, op_.N, op_.bitSize);
-		if (fp::isGreaterOrEqualArray(v_, op_.p, op_.N)) {
-			fp::maskArray(v_, op_.N, op_.bitSize - 1);
+		bint::maskN(v_, op_.N, op_.bitSize);
+		if (bint::cmpGeN(v_, op_.p, op_.N)) {
+			bint::maskN(v_, op_.N, op_.bitSize - 1);
 		}
 		toMont();
 	}
@@ -426,7 +382,7 @@ public:
 	template<class S>
 	void setArrayMod(bool *pb, const S *x, size_t n)
 	{
-		if (sizeof(S) * n > sizeof(fp::Unit) * op_.N * 2) {
+		if (sizeof(S) * n > sizeof(Unit) * op_.N * 2) {
 			*pb = false;
 			return;
 		}
@@ -452,6 +408,25 @@ public:
 			b.p = &v_[0];
 		}
 	}
+	// u must be the array of the length getUnitSize() (= op_.N)
+	void getUnitArray(Unit *u) const
+	{
+		if (isMont()) {
+			op_.fromMont(u, v_);
+		} else {
+			for (size_t i = 0, n = op_.N; i < n; i++) u[i] = v_[i];
+		}
+	}
+	// u must be the array of the length getUnitSize() (= op_.N)
+	// u[] must be less than p
+	void setUnitArray(const Unit *u)
+	{
+		if (isMont()) {
+			op_.toMont(v_, u);
+		} else {
+			for (size_t i = 0, n = op_.N; i < n; i++) v_[i] = u[i];
+		}
+	}
 	/*
 		write a value with little endian
 		write buf[0] = 0 and return 1 if the value is 0
@@ -461,7 +436,7 @@ public:
 	{
 		fp::Block b;
 		getBlock(b);
-		size_t n = sizeof(fp::Unit) * b.n;
+		size_t n = sizeof(Unit) * b.n;
 		uint8_t *t = (uint8_t*)CYBOZU_ALLOCA(n);
 		if (!fp::convertArrayAsLE(t, n, b.p, b.n)) {
 			return 0;
@@ -479,27 +454,17 @@ public:
 	}
 	/*
 		set (little endian % p)
-		error if xn > 64
 	*/
 	void setLittleEndianMod(bool *pb, const uint8_t *x, size_t xn)
 	{
-		if (xn > 64) {
-			*pb = false;
-			return;
-		}
 		setArrayMod(pb, x, xn);
 	}
 	/*
 		set (big endian % p)
-		error if xn > 64
 	*/
 	void setBigEndianMod(bool *pb, const uint8_t *x, size_t xn)
 	{
-		if (xn > 64) {
-			*pb = false;
-			return;
-		}
-		uint8_t swapX[64];
+		uint8_t *swapX = (uint8_t*)CYBOZU_ALLOCA(xn);
 		for (size_t i = 0; i < xn; i++) {
 			swapX[xn - 1 - i] = x[i];
 		}
@@ -564,7 +529,7 @@ public:
 			*pb = false;
 			return;
 		}
-		setArray(pb, gmp::getUnit(x), gmp::getUnitSize(x));
+		setArrayMod(pb, gmp::getUnit(x), gmp::getUnitSize(x));
 	}
 	static void add(FpT& z, const FpT& x, const FpT& y)
 	{
@@ -611,28 +576,24 @@ public:
 #ifdef MCL_XBYAK_DIRECT_CALL
 		op_.fp_mul2A_(y.v_, x.v_);
 #else
-		op_.fp_mul2(y.v_, x.v_, op_.p);
+		add(y, x, x);
+//		op_.fp_mul2(y.v_, x.v_, op_.p);
 #endif
 	}
 	static void mul9(FpT& y, const FpT& x)
 	{
-#ifdef MCL_XBYAK_DIRECT_CALL
-		op_.fp_mul9A_(y.v_, x.v_);
-#else
-		mul9A(y.v_, x.v_);
-#endif
+		mulUnit(y, x, 9);
 	}
 	static inline void addPre(FpT& z, const FpT& x, const FpT& y) { op_.fp_addPre(z.v_, x.v_, y.v_); }
 	static inline void subPre(FpT& z, const FpT& x, const FpT& y) { op_.fp_subPre(z.v_, x.v_, y.v_); }
-	static inline void mulSmall(FpT& z, const FpT& x, const uint32_t y)
-	{
-		mulSmall(z.v_, x.v_, y);
-	}
 	static inline void mulUnit(FpT& z, const FpT& x, const Unit y)
 	{
-		if (mulSmallUnit(z, x, y)) return;
+		if (mcl::fp::mulSmallUnit(z, x, y)) return;
+		if (op_.mulSmallUnit(op_.smallModP, z.v_, x.v_, y)) return;
 		op_.fp_mulUnit(z.v_, x.v_, y, op_.p);
 	}
+	// alias of mulUnit
+	static inline void mulSmall(FpT& z, const FpT& x, const uint32_t y) { mulUnit(z, x, y); }
 	static inline void inv(FpT& y, const FpT& x)
 	{
 		assert(!x.isZero());
@@ -640,15 +601,11 @@ public:
 	}
 	static inline void divBy2(FpT& y, const FpT& x)
 	{
-#if 0
-		mul(y, x, inv2_);
-#else
 		bool odd = (x.v_[0] & 1) != 0;
 		op_.fp_shr1(y.v_, x.v_);
 		if (odd) {
 			op_.fp_addPre(y.v_, y.v_, op_.half);
 		}
-#endif
 	}
 	static inline void divBy4(FpT& y, const FpT& x)
 	{
@@ -656,7 +613,7 @@ public:
 		divBy2(y, y);
 	}
 	bool isZero() const { return op_.fp_isZero(v_); }
-	bool isOne() const { return fp::isEqualArray(v_, op_.oneRep, op_.N); }
+	bool isOne() const { return bint::cmpEqN(v_, op_.oneRep, op_.N); }
 	static const inline FpT& one() { return *reinterpret_cast<const FpT*>(op_.oneRep); }
 	/*
 		half = (p + 1) / 2
@@ -667,11 +624,11 @@ public:
 	{
 		fp::Block b;
 		getBlock(b);
-		return fp::isGreaterOrEqualArray(b.p, op_.half, op_.N);
+		return bint::cmpGeN(b.p, op_.half, op_.N);
 	}
 	bool isValid() const
 	{
-		return fp::isLessArray(v_, op_.p, op_.N);
+		return bint::cmpLtN(v_, op_.p, op_.N);
 	}
 	uint64_t getUint64(bool *pb) const
 	{
@@ -685,7 +642,7 @@ public:
 		getBlock(b);
 		return fp::getInt64(pb, b, op_);
 	}
-	bool operator==(const FpT& rhs) const { return fp::isEqualArray(v_, rhs.v_, op_.N); }
+	bool operator==(const FpT& rhs) const { return bint::cmpEqN(v_, rhs.v_, op_.N); }
 	bool operator!=(const FpT& rhs) const { return !operator==(rhs); }
 	/*
 		@note
@@ -696,14 +653,14 @@ public:
 		fp::Block xb, yb;
 		x.getBlock(xb);
 		y.getBlock(yb);
-		return fp::compareArray(xb.p, yb.p, op_.N);
+		return bint::cmpN(xb.p, yb.p, op_.N);
 	}
 	bool isLess(const FpT& rhs) const
 	{
 		fp::Block xb, yb;
 		getBlock(xb);
 		rhs.getBlock(yb);
-		return fp::isLessArray(xb.p, yb.p, op_.N);
+		return bint::cmpLtN(xb.p, yb.p, op_.N);
 	}
 	bool operator<(const FpT& rhs) const { return isLess(rhs); }
 	bool operator>=(const FpT& rhs) const { return !operator<(rhs); }
@@ -715,29 +672,28 @@ public:
 	*/
 	static inline int compareRaw(const FpT& x, const FpT& y)
 	{
-		return fp::compareArray(x.v_, y.v_, op_.N);
+		return bint::cmpN(x.v_, y.v_, op_.N);
 	}
 	bool isLessRaw(const FpT& rhs) const
 	{
-		return fp::isLessArray(v_, rhs.v_, op_.N);
+		return bint::cmpLtN(v_, rhs.v_, op_.N);
 	}
 	/*
 		set IoMode for operator<<(), or operator>>()
 	*/
 	static inline void setIoMode(int ioMode)
 	{
-		ioMode_ = ioMode;
+		op_.ioMode_ = ioMode;
 	}
 	static void setETHserialization(bool ETHserialization)
 	{
-		isETHserialization_ = ETHserialization;
+		op_.ETHserialization_ = ETHserialization;
 	}
 	static bool getETHserialization()
 	{
-		return isETHserialization_;
+		return op_.ETHserialization_;
 	}
-	static inline bool isETHserialization() { return isETHserialization_; }
-	static inline int getIoMode() { return ioMode_; }
+	static inline int getIoMode() { return op_.ioMode_; }
 	static inline size_t getModBitLen() { return getBitSize(); }
 	static inline void setHashFunc(uint32_t hash(void *out, uint32_t maxOutSize, const void *msg, uint32_t msgSize))
 	{
@@ -858,10 +814,14 @@ public:
 #endif
 };
 
-template<class tag, size_t maxBitSize> fp::Op FpT<tag, maxBitSize>::op_;
-template<class tag, size_t maxBitSize> FpT<tag, maxBitSize> FpT<tag, maxBitSize>::inv2_;
-template<class tag, size_t maxBitSize> int FpT<tag, maxBitSize>::ioMode_ = IoAuto;
-template<class tag, size_t maxBitSize> bool FpT<tag, maxBitSize>::isETHserialization_ = false;
+#if defined(__GNUC__) && !defined(__ANDROID__)
+	// x must be in [200, 65535]. lower values indicate a higher priority.
+	#define MCL_INIT_PRIORITY(x) __attribute__((init_priority(x)))
+#else
+	#define MCL_INIT_PRIORITY(x)
+#endif
+// Change the priority ad hoc so that initPairing() can be called in the static constructor before the main function
+template<class tag, size_t maxBitSize> fp::Op FpT<tag, maxBitSize>::op_ MCL_INIT_PRIORITY(200);
 
 } // mcl
 

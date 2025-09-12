@@ -19,7 +19,7 @@ typedef mcl::FpT<mcl::FpTag, 384> Fp;
 typedef mcl::Fp2T<Fp> Fp2;
 typedef mcl::FpDblT<Fp> FpDbl;
 typedef mcl::Fp6T<Fp> Fp6;
-typedef mcl::Fp12T<Fp> Fp12;
+typedef mcl::Fp12T<Fp, Fp/*dummy*/> Fp12;
 
 bool g_benchOnly = false;
 
@@ -266,7 +266,7 @@ void testFpDbl()
 		std::string pstr;
 		Fp::getModulo(pstr);
 		mpz_class mp(pstr);
-		mp <<= Fp::getUnitSize() * mcl::fp::UnitBitSize;
+		mp <<= Fp::getUnitSize() * mcl::UnitBitSize;
 		mpz_class mp1 = mp - 1;
 		mcl::gmp::getStr(pstr, mp1);
 		const char *tbl[] = {
@@ -443,9 +443,10 @@ void testAll()
 		"0x0000000000000001000000000000000000000000000000000000000000000085", // min prime
 		"0x2523648240000001ba344d80000000086121000000000013a700000000000013",
 		"0x7523648240000001ba344d80000000086121000000000013a700000000000017",
-		// max prime less than 2**256/4
 		"0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0b",
 		"0x800000000000000000000000000000000000000000000000000000000000005f",
+		"0xfffffffffffcf0cd46e5f25eee71a49f0cdc65fb12980a82d3292ddbaed33013", // BN_P256 p
+		"0xfffffffffffcf0cd46e5f25eee71a49e0cdc65fb1299921af62d536cd10b500d", // BN_P256 r
 		"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff43", // max prime
 #if MCL_MAX_BIT_SIZE >= 384
 		// N = 6

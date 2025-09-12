@@ -7,6 +7,10 @@ message standbyBSP {
     uint32 id = 1;
 }
 
+message honestAuditor {
+    string id = 1;
+}
+
 message auditMsg {
   uint32 blkNum = 1;
   string prevHash = 2;
@@ -16,17 +20,18 @@ message auditMsg {
   string curHash = 6;
   string leaderID = 7;
   bytes signature = 8;
-  repeated string honestAuditors = 9;
+  repeated honestAuditor honestAuditors = 9;
 
   enum Phases {
-    PREPARE = 0;
-    AGGREGATED_PREPARE = 1;
-    COMMIT = 2;
-    AGGREGATED_COMMIT = 3;
+    PHASE_UNSPECIFIED = 0; // 값이 안 세팅된 경우 구분용
+    PREPARE = 1;
+    AGGREGATED_PREPARE = 2;
+    COMMIT = 3;
+    AGGREGATED_COMMIT = 4;
   }
-
   Phases phaseNum = 10;
   repeated bytes txList = 11;
+  map<string, int32> aborttransactionnum = 12;
 }
 
 message wnode {
@@ -34,6 +39,9 @@ message wnode {
   string addr = 2;
   string port = 3;
   bytes publickey = 4;
+  string seed = 5;
+  bytes proof = 6;
+  bytes value =7;
 }
 
 message shard {

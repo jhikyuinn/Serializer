@@ -10,25 +10,41 @@ mcl is a library for pairing-based cryptography,
 which supports the optimal Ate pairing over BN curves and BLS12-381 curves.
 
 # News
+- mulVec (resp. mulEach) with AVX-512 IFMA is 1.52 (resp. 3.26) times faster than without it.
+- Add {Fp,Fr,Fp2}::squareRoot.
+- Improve the performance of squareRoot.
+- Add batch inversion for Fr and Fp elements, and batch normalization for G1 and G2 points.
+- mulVec is a little improved.
+- mulEach with AVX-512 IFMA is improved slightly and 2.8 times faster than G1::mul on BLS12-381.
+- mulVec (multi scalar multiplication) with AVX-512 IFMA is 1.4 times faster on Xeon w9-3495X
+- a little performance improvement of G1::mulVec of BLS12-381
+- improve performance of Fr::inv on M1 mac
+- add mcl::bn::isValidGT(x) and mclBnGT_isValid(x) to check x in GT for x in Fp12.
+- support BN\_P256 (hash-to-curve is not yet standard way.)
+- the performance of `{G1,G2}::mulVec(z, xVec, yVec, n)` has improved for n >= 256. (about 2x speed up for n = 512).
+  - But it changes the type of xVec from `const G*` to `G*` because xVec may be normalized when computing.
+  - fix mul(G, G, F) for F = Fp at v1.61
+- add set DST functions for hashMapToGi
+- add F::invVec, G::normalizeVec
+- improve SECP256K1 for x64
+- add G1::mulVecMT, G2::mulVecMT (enabled by MCL_USE_OMP=1)
+- improve mulMod of SECP256K1 for wasm
+- fix FpToG1(P, u, v) and Fp2ToG2(P, u, v) when u == v (This bug does not affect mapToG1 and mapToG2).
+- add millerLoopVecMT (enabled if built with MCL_USE_OMP=1)
 - support s390x(systemz)
 - improve M1 mac performance
 - set default `MCL_MAX_BIT_SIZE=512` so disable to support `NICT_P521`.
 - improve performance
 - support M1 mac
-- dst for mapToG1 has changed to `BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_`.
-- `mclBn_eth*` functions are removed.
-- `mcl::bn::mapToG1(G1& out, const Fp& v)` supports `BLS12_MAP_FP_TO_G1` in [EIP 2537](https://eips.ethereum.org/EIPS/eip-2537).
-- `mcl::bn::hashAndMapToG1(G1& out, const void *msg, size_t msgSize)` supports ([hash-to-curve-09 BLS12381G1_XMD:SHA-256_SSWU_RO_](https://www.ietf.org/id/draft-irtf-cfrg-hash-to-curve-09.html#name-bls12381g1_xmdsha-256_sswu_))
-- `MCL_MAP_TO_MODE_HASH_TO_CURVE_07` is added for [hash-to-curve-draft-07](https://datatracker.ietf.org/doc/draft-irtf-cfrg-hash-to-curve/07/).
 
 # Support architecture
 
-- x86-64 Windows + Visual Studio
+- x86-64 Windows + Visual Studio 2015 (or later)
 - x86, x86-64 Linux + gcc/clang
 - x86-64, M1 macOS
 - ARM / ARM64 Linux
-- WebAssembly
-- Android
+- WebAssembly : see [mcl-wasm](https://github.com/herumi/mcl-wasm)
+- Android : see [mcl-android](https://github.com/herumi/mcl-android)
 - iPhone
 - s390x(systemz)
   - install llvm and clang, and `make UPDATE_ASM=1` once.
@@ -43,30 +59,96 @@ which supports the optimal Ate pairing over BN curves and BLS12-381 curves.
   - BN462 ; a BN curve over the 462-bit prime p(z) where z = 2^114 + 2^101 - 2^14 - 1.
 - BLS12\_381 ; [a BLS12-381 curve](https://blog.z.cash/new-snark-curve/)
 
+# BLS signature
+See [bls](https://github.com/herumi/bls) if you want mcl for BLS-signature.
+
 # C-API
-see [api.md](api.md)
+See [api.md](api.md) and [FAQ](api.md#faq) for serialization and hash-to-curve.
 
 # How to build on Linux and macOS
 x86-64/ARM/ARM64 Linux, macOS and mingw64 are supported.
 
-## Installation Requirements
+GMP is necessary only to build test programs.
+- `sudo apt install libgmp-dev` on Ubuntu
+- `brew install gmp` on macOS
 
-[GMP](https://gmplib.org/) is necessary (default setting).
-
-```
-apt install libgmp-dev # on Ubuntu
-```
+OpenMP is optional (`make MCL_USE_OMP=1` to use OpenMP for `mulVec`)
+- `sudo apt install libomp-dev` on Ubuntu
+- `brew install libomp`
 
 ## How to build with Makefile
 
+For x86-64 Linux and macOS,
+
 ```
-git clone git://github.com/herumi/mcl
+git clone https://github.com/herumi/mcl
 cd mcl
 make -j4
+```
+clang++ is required except for x86-64 on Linux and Windows.
+
+```
+make -j4 CXX=clang++
 ```
 
 - `lib/libmcl.*` ; core library
 - `lib/libmclbn384_256.*` ; library to use C-API of BLS12-381 pairing
+
+# How to build with CMake
+
+For x86-64 Linux and macOS.
+```
+mkdir build
+cd build
+cmake ..
+make
+```
+
+For the other platform (including mingw), clang++ is required.
+```
+mkdir build
+cd build
+cmake .. -DCMAKE_CXX_COMPILER=clang++
+make
+```
+Use `clang++` instead of gcc on mingw.
+
+For Visual Studio, (REMARK : It is not maintained; use the vcxproj file.)
+```
+mkdir build
+cd build
+cmake .. -A x64
+msbuild mcl.sln /p:Configuration=Release /m
+```
+
+## How to build a static library with Visual Studio
+Open `mcl.sln` and build it.
+`src/proj/lib/lib.vcxproj` is to build a static library `lib/mcl.lib` which is defined `MCL_MAX_BIT_SIZE=384`.
+
+## options
+
+see `cmake .. -LA`.
+
+## tests
+make test binaries in `./bin`.
+```
+cmake .. -DBUILD_TESTING=ON
+make -j4
+```
+
+
+## How to make from src/{base,bint}{32,64}.ll
+
+clang (clang-cl on Windows) is necessary to build files with a suffix ll.
+
+- BIT = 64 (if 64-bit CPU) else 32
+- `src/base${BIT}.ll` is necessary if `MCL_USE_LLVM` is defined.
+  - This code is used if xbyak is not used.
+- `src/bint${BIT}.ll` is necessary if `MCL_BINT_ASM=1`.
+  - `src/bint-x64-{amd64,win}.asm` is used instead if `MCL_BINT_ASM_X64=1`.
+  - It is faster than `src/bint64.ll` because it uses mulx/adox/adcx.
+
+These files may be going to be unified in the future.
 
 ## How to test of BLS12-381 pairing
 
@@ -78,13 +160,15 @@ make bin/bn_c384_256_test.exe && bin/bn_c384_256_test.exe
 make bin/bls12_test.exe && bin/bls12_test.exe
 ```
 
-## How to build without GMP
+### How to make a library for BLS12-381 without Xbyak
+On x64 environment, mcl uses JIT code, but if you want to avoid them,
 
 ```
-make MCL_USE_GMP=0
-
+make lib/libmcl.a MCL_STATIC_CODE=1 -j
+# test of pairing
+make test_static
 ```
-Define `MCL_USE_VINT` if using C++ header files.
+The generated library supports only *BLS12_381* and requires compiler options `-DMCL_MAX_BIT_SIZE=384 -DMCL_STATIC_CODE`.
 
 ## How to profile on Linux
 
@@ -103,14 +187,32 @@ env MCL_PROF=2 bin/bls12_test.exe
 
 ## How to build on 32-bit x86 Linux
 
-Build GMP for 32-bit mode (`env ABI=32 ./configure --enable-cxx ...`) and install `<lib32>` at yourself.
+Build GMP for 32-bit mode.
 
 ```
-make ARCH=x86 CFLAGS_USER="-I <lib32>/include" LDFLAGS_USER="-L <lib32>/lib -Wl,-rpath,<lib32>/lib"
+sudo apt install g++-multilib
+sudo apt install clang-14
+cd <GMP dir>
+env ABI=32 ./configure --enable-cxx --prefix=<install dir>
+make -j install
+cd <mcl dir>
+make ARCH=x86 LLVM_VER=-14 GMP_DIR=<install dir>
 ```
+
+# How to build a library for arm with clang++ on Linux
+
+```
+make -f Makefile.cross BIT=32 TARGET=armv7l
+sudo apt install g++-arm-linux-gnueabi
+arm-linux-gnueabi-g++ sample/pairing.cpp -O3 -DNDEBUG -I ./include/ lib/libmclbn384_256.a -DMCL_MAX_BIT_SIZE=384
+env QEMU_LD_PREFIX=/usr/arm-linux-gnueabi/ qemu-arm ./a.out
+```
+
+The static library `libbls384_256.a` built by `bls/Makefile.onelib` in [bls](https://github.com/herumi/bls) contains all mcl functions. So please see [the comment of Makefile.onelib](https://github.com/herumi/bls/blob/master/Makefile.onelib#L198) if you want to build this library on the other platform such as Mingw64 on Linux.
 
 # How to build on 64-bit Windows with Visual Studio
 
+Python3 is necessary.
 Open a console window, and
 ```
 git clone https://github.com/herumi/mcl
@@ -139,42 +241,6 @@ cd ffi/cs
 dotnet build mcl.sln
 cd ../../bin
 ../ffi/cs/test/bin/Debug/netcoreapp3.1/test.exe
-```
-
-# How to build with CMake
-
-For Linux, macOS, etc.
-```
-mkdir build
-cd build
-cmake ..
-make
-```
-For Visual Studio,
-```
-mkdir build
-cd build
-cmake .. -A x64
-msbuild mcl.sln /p:Configuration=Release /m
-```
-
-For your convenience you could use the build script `build.sh` on Linux, macOS and
-Windows (requires Git Bash).
-
-On Windows, `build.sh` expects [cybozulib_ext](https://github.com/herumi/cybozulib_ext) to be within the same parent directory, otherwise, it will be downloaded into `external\cybozulib_ext` directory.
-
-## options
-
-```
-cmake .. MCL_USE_GMP=OFF ; without GMP
-```
-see `cmake .. -LA`.
-
-## tests
-make test binaries in `./bin`.
-```
-cmake .. -DBUILD_TESTING=ON
-make -j4
 ```
 
 # How to build for wasm(WebAssembly)
@@ -352,7 +418,11 @@ void setHash(F& x, const void *msg, size_t msgSize)
 
 
 # History
-
+- 2022/Apr/10 v1.60 improve {G1,G2}::mulVec
+- 2022/Mar/25 v1.59 add set DST functions for hashMapToGi
+- 2022/Mar/24 add F::invVec, G::normalizeVec
+- 2022/Mar/08 v1.58 improve SECP256K1 for x64
+- 2022/Feb/13 v1.57 add mulVecMT
 - 2021/Aug/26 v1.52 improve {G1,G2}::isValidOrder() for BLS12-381
 - 2021/May/04 v1.50 support s390x(systemz)
 - 2021/Apr/21 v1.41 fix inner function of mapToGi for large dst (not affect hashAndMapToGi)

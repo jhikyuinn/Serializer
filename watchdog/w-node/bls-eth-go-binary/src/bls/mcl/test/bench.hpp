@@ -67,6 +67,41 @@ void invAdd(T& out, const T& x, const T& y)
 	out += y;
 }
 
+template<class F>
+void invVecBench(const char *msg)
+{
+	const size_t n = 1000;
+	F x[n];
+	cybozu::XorShift rg;
+	for (size_t i = 0; i < n; i++) {
+		x[i].setByCSPRNG(rg);
+	}
+	const size_t zeroTbl[] = { 10, 20, 30, 40 };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(zeroTbl); i++) {
+		x[zeroTbl[i]].clear();
+	}
+	const size_t oneTbl[] = { 100, 200, 300 };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(oneTbl); i++) {
+		x[oneTbl[i]] = 1;
+	}
+	const int C = 10;
+	CYBOZU_BENCH_C(msg, C, mcl::invVec, x, x, n);
+}
+
+template<class T>
+void sqrBench(const T& x, const char *msg)
+{
+	T y = x * x, z;
+	CYBOZU_BENCH_C((std::string(msg) + "::squareRoot T").c_str(), 10000, T::squareRoot, z, y);
+	for (int i = 0; i < 100; i++) {
+		if (!T::squareRoot(z, y)) {
+			break;
+		}
+		y += T::one();
+	}
+	CYBOZU_BENCH_C((std::string(msg) + "::squareRoot F").c_str(), 10000, T::squareRoot, z, y);
+}
+
 void testBench(const G1& P, const G2& Q)
 {
 #ifndef NDEBUG
@@ -86,7 +121,9 @@ void testBench(const G1& P, const G2& Q)
 #if 1
 	const int C2 = 3000;
 	{
-		mpz_class a = x.getMpz();
+		cybozu::XorShift rg;
+		Fr a;
+		a.setByCSPRNG(rg);
 		CYBOZU_BENCH_C("G1::mulCT     ", C, G1::mulCT, Pa, P, a);
 		CYBOZU_BENCH_C("G1::mul       ", C, G1::mul, Pa, Pa, a);
 		CYBOZU_BENCH_C("G1::add       ", C, G1::add, Pa, Pa, P);
@@ -118,6 +155,7 @@ void testBench(const G1& P, const G2& Q)
 	CYBOZU_BENCH_C("Fp::sub       ", C3, Fp::sub, x, x, y);
 	CYBOZU_BENCH_C("Fp::add 2     ", C3, Fp::add, x, x, x);
 	CYBOZU_BENCH_C("Fp::mul2      ", C3, Fp::mul2, x, x);
+	CYBOZU_BENCH_C("Fp::mulSmall7 ", C3, Fp::mulSmall, x, x, 7);
 	CYBOZU_BENCH_C("Fp::mulSmall8 ", C3, Fp::mulSmall, x, x, 8);
 	CYBOZU_BENCH_C("Fp::mulUnit8  ", C3, Fp::mulUnit, x, x, 8);
 	CYBOZU_BENCH_C("Fp::mul9      ", C3, Fp::mul9, x, x);
@@ -127,6 +165,9 @@ void testBench(const G1& P, const G2& Q)
 	CYBOZU_BENCH_C("Fp::sqr       ", C3, Fp::sqr, x, x);
 	CYBOZU_BENCH_C("Fp::inv       ", C3, invAdd, x, x, y);
 	CYBOZU_BENCH_C("Fp::pow       ", C3, Fp::pow, x, x, y);
+	sqrBench(x, "Fp");
+	invVecBench<Fp>("Fp:invVec");
+	invVecBench<Fr>("Fr:invVec");
 	{
 		Fr a, b, c;
 		a.setHashOf("abc", 3);
@@ -136,10 +177,13 @@ void testBench(const G1& P, const G2& Q)
 		CYBOZU_BENCH_C("Fr::neg       ", C3, Fr::neg, a, a);
 		CYBOZU_BENCH_C("Fr::add 2     ", C3, Fr::add, a, a, b);
 		CYBOZU_BENCH_C("Fr::mul2      ", C3, Fr::mul2, a, a);
+		CYBOZU_BENCH_C("Fr::mulSmall7 ", C3, Fr::mulSmall, a, a, 7);
+		CYBOZU_BENCH_C("Fr::mulSmall8 ", C3, Fr::mulSmall, a, a, 8);
 		CYBOZU_BENCH_C("Fr::mul       ", C3, Fr::mul, a, a, b);
 		CYBOZU_BENCH_C("Fr::sqr       ", C3, Fr::sqr, a, a);
 		CYBOZU_BENCH_C("Fr::inv       ", C3, invAdd, a, a, b);
 		CYBOZU_BENCH_C("Fr::pow       ", C3, Fr::pow, a, a, b);
+		sqrBench(a, "Fr");
 	}
 	Fp2 xx, yy;
 	xx.a = x;
@@ -256,5 +300,29 @@ void testLagrange()
 				CYBOZU_TEST_EQUAL(s, c[0]);
 			}
 		}
+	}
+	{
+		const int n = 50;
+		cybozu::XorShift rg;
+		const int k = 40;
+		Fr c[k];
+		Fr x[n], y[n];
+		for (size_t i = 0; i < k; i++) {
+			c[i].setByCSPRNG(rg);
+		}
+		for (size_t i = 0; i < n; i++) {
+			x[i].setByCSPRNG(rg);
+			mcl::evaluatePolynomial(y[i], c, k, x[i]);
+		}
+		Fr s;
+		bool b;
+		mcl::LagrangeInterpolation(&b, s, x, y, k);
+		CYBOZU_TEST_ASSERT(b);
+		CYBOZU_TEST_EQUAL(s, c[0]);
+#ifndef NDEBUG
+	puts("lagrange bench skip in debug");
+	return;
+#endif
+		CYBOZU_BENCH_C("LagrangeInterpolation", 100, mcl::LagrangeInterpolation, &b, s, x, y, k);
 	}
 }

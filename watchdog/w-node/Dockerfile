@@ -4,11 +4,11 @@ FROM golang:1.23-bullseye AS deps
 WORKDIR /app
 
 COPY go.mod go.sum ./
-COPY mp2btp-main ./mp2btp-main
+# COPY mp2btp-main ./mp2btp-main
 
 ENV GOPROXY=direct
 
-RUN go mod download
+# RUN go mod download
 
 
 # Stage 2: Build 및 실행 환경
@@ -28,11 +28,11 @@ RUN curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/sh
 
 RUN mkdir -p /data/db
 
-WORKDIR /app
+# WORKDIR /app
 
-# deps 스테이지에서 다운받은 모듈 복사
-COPY --from=deps /go/pkg /go/pkg
-# COPY --from=deps /app/mp2btp-main ./mp2btp-main
+# # deps 스테이지에서 다운받은 모듈 복사
+# COPY --from=deps /go/pkg /go/pkg
+# # COPY --from=deps /app/mp2btp-main ./mp2btp-main
 
 COPY go.mod go.sum ./
 

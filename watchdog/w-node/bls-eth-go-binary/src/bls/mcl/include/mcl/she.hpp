@@ -10,6 +10,13 @@
 #include <cmath>
 #include <vector>
 #include <iosfwd>
+
+#if defined(MCL_MAX_FP_BIT_SIZE) && MCL_MAX_FP_BIT_SIZE == 384 && defined(MCL_MAX_FR_BIT_SIZE) && MCL_MAX_FR_BIT_SIZE == 256
+
+// already include bls12_381.hpp
+
+#else
+
 #ifndef MCLBN_FP_UNIT_SIZE
 	#define MCLBN_FP_UNIT_SIZE 4
 #endif
@@ -22,6 +29,8 @@
 #else
 #define MCL_MAX_FP_BIT_SIZE (MCLBN_FP_UNIT_SIZE * 64)
 #include <mcl/bn.hpp>
+#endif
+
 #endif
 
 #include <mcl/window_method.hpp>
@@ -40,7 +49,8 @@ namespace local {
 	#define MCLSHE_WIN_SIZE 10
 #endif
 static const size_t winSize = MCLSHE_WIN_SIZE;
-static const size_t defaultTryNum = 2048;
+static const size_t defaultHashSize = 1024;
+static const size_t defaultTryNum = 1;
 
 struct KeyCount {
 	uint32_t key;
@@ -61,9 +71,8 @@ struct InterfaceForHashTable : G {
 	static const G& castG(const InterfaceForHashTable& x) { return static_cast<const G&>(x); }
 	void clear() { clear(castG(*this)); }
 	void normalize() { normalize(castG(*this)); }
-	static bool isOdd(const G& P) { return P.y.isOdd(); }
 	static bool isZero(const G& P) { return P.isZero(); }
-	static bool isSameX(const G& P, const G& Q) { return P.x == Q.x; }
+	static int isEqualOrMinus(const G& P, const G& Q) { return P.isEqualOrMinus(Q); }
 	static uint32_t getHash(const G& P) { return uint32_t(*P.x.getUnit()); }
 	static void clear(G& P) { P.clear(); }
 	static void normalize(G& P) { P.normalize(); }
@@ -85,9 +94,16 @@ struct InterfaceForHashTable<G, false> : G {
 	static const G& castG(const InterfaceForHashTable& x) { return static_cast<const G&>(x); }
 	void clear() { clear(castG(*this)); }
 	void normalize() { normalize(castG(*this)); }
-	static bool isOdd(const G& x) { return x.b.a.a.isOdd(); }
 	static bool isZero(const G& x) { return x.isOne(); }
-	static bool isSameX(const G& x, const G& Q) { return x.a == Q.a; }
+	// (P == Q) ? 1 : (P == 1/Q) ? -1 : 0
+	static int isEqualOrMinus(const G& P, const G& Q)
+	{
+		if (P.a == Q.a) {
+			if (P.b == Q.b) return 1;
+			if (P.b == -Q.b) return -1;
+		}
+		return 0;
+	}
 	static uint32_t getHash(const G& x) { return uint32_t(*x.getFp0()->getUnit()); }
 	static void clear(G& x) { x = 1; }
 	static void normalize(G&) { }
@@ -136,7 +152,7 @@ public:
 	/*
 		compute log_P(xP) for |x| <= hashSize * tryNum
 	*/
-	void init(const G& P, size_t hashSize, size_t tryNum = local::defaultTryNum)
+	void init(const G& P, size_t hashSize)
 	{
 		if (hashSize == 0) {
 			kcv_.clear();
@@ -144,7 +160,6 @@ public:
 		}
 		if (hashSize >= 0x80000000u) throw cybozu::Exception("HashTable:init:hashSize is too large");
 		P_ = P;
-		tryNum_ = tryNum;
 		kcv_.resize(hashSize);
 		G xP;
 		I::clear(xP);
@@ -152,7 +167,7 @@ public:
 			I::add(xP, xP, P_);
 			I::normalize(xP);
 			kcv_[i - 1].key = I::getHash(xP);
-			kcv_[i - 1].count = I::isOdd(xP) ? i : -i;
+			kcv_[i - 1].count = i;
 		}
 		nextP_ = xP;
 		I::dbl(nextP_, nextP_);
@@ -163,6 +178,11 @@ public:
 		*/
 		std::stable_sort(kcv_.begin(), kcv_.end());
 		setWindowMethod();
+	}
+	void init(const G& P, size_t hashSize, size_t tryNum)
+	{
+		init(P, hashSize);
+		setTryNum(tryNum);
 	}
 	void setTryNum(size_t tryNum)
 	{
@@ -198,11 +218,9 @@ public:
 //			I::mul(T, P, abs_c - prev);
 			mulByWindowMethod(T, abs_c - prev);
 			I::add(Q, Q, T);
-			I::normalize(Q);
-			if (I::isSameX(Q, xP)) {
-				bool QisOdd = I::isOdd(Q);
-				bool xPisOdd = I::isOdd(xP);
-				if (QisOdd ^ xPisOdd ^ neg) return -count;
+			int v = I::isEqualOrMinus(Q, xP);
+			if (v) {
+				if ((v == -1) ^ neg) return -count;
 				return count;
 			}
 			prev = abs_c;
@@ -250,7 +268,7 @@ public:
 			*pok = false;
 			return 0;
 		}
-		throw cybozu::Exception("HashTable:log:not found");
+		throw cybozu::Exception("HashTable:log:not found:tryNum") << tryNum_;
 	}
 	/*
 		remark
@@ -307,6 +325,7 @@ public:
 	{
 		wm_.mul(static_cast<I&>(x), y);
 	}
+	size_t getTableSize() const { return kcv_.size(); }
 };
 
 template<class G>
@@ -347,6 +366,37 @@ struct Hash {
 	}
 };
 
+template<class C>
+struct CipherAsArrayOfEc {
+	typedef typename C::G G;
+	C* c;
+	CipherAsArrayOfEc(C* c) : c(c) {}
+	G& operator[](size_t i)
+	{
+		if (i & 1) {
+			return c[i / 2].getNonConstRefT();
+		} else {
+			return c[i / 2].getNonConstRefS();
+		}
+	}
+	void operator+=(size_t n)
+	{
+		assert((n & 1) == 0);
+		c += n/2;
+	}
+};
+
+// AsArrayOfFp[i] gets P[i].z
+template<class C>
+struct AsArrayOfFp {
+	typedef typename C::G::Fp Fp;
+	C& c;
+	AsArrayOfFp(C& c) : c(c) {}
+	const Fp& operator[](size_t i) const { return c[i].z; }
+	void operator+=(size_t n) { c += n; }
+};
+
+
 } // mcl::she::local
 
 template<size_t dummyInpl = 0>
@@ -371,9 +421,11 @@ struct SHET {
 	static bool useDecG1ViaGT_;
 	static bool useDecG2ViaGT_;
 	static bool isG1only_;
-private:
-	template<class G>
-	class CipherTextAT : public fp::Serializable<CipherTextAT<G> > {
+	template<class _G>
+	class CipherTextAT : public fp::Serializable<CipherTextAT<_G> > {
+	public:
+		typedef _G G;
+	private:
 		G S_, T_;
 		friend class SecretKey;
 		friend class PublicKey;
@@ -395,6 +447,11 @@ private:
 		{
 			S_.clear();
 			T_.clear();
+		}
+		void normalize()
+		{
+			S_.normalize();
+			T_.normalize();
 		}
 		bool isValid() const
 		{
@@ -477,6 +534,7 @@ private:
 		}
 		bool operator!=(const CipherTextAT& rhs) const { return !operator==(rhs); }
 	};
+private:
 	/*
 		g1 = millerLoop(P1, Q)
 		g2 = millerLoop(P2, Q)
@@ -642,7 +700,7 @@ public:
 		}
 	};
 
-	static void init(const mcl::CurveParam& cp = mcl::BN254, size_t hashSize = 1024, size_t tryNum = local::defaultTryNum)
+	static void init(const mcl::CurveParam& cp = mcl::BN254, size_t hashSize = local::defaultHashSize, size_t tryNum = local::defaultTryNum)
 	{
 		initPairing(cp);
 		hashAndMapToG1(P_, "0");
@@ -655,21 +713,21 @@ public:
 		isG1only_ = false;
 		setTryNum(tryNum);
 	}
-	static void init(size_t hashSize, size_t tryNum = local::defaultTryNum)
-	{
-		init(mcl::BN254, hashSize, tryNum);
-	}
 	/*
 		standard lifted ElGamal encryption
 	*/
-	static void initG1only(const mcl::EcParam& para, size_t hashSize = 1024, size_t tryNum = local::defaultTryNum)
+	static void initG1only(int curveType, size_t hashSize = local::defaultHashSize, size_t tryNum = local::defaultTryNum)
 	{
-		mcl::initCurve<G1, Fr>(para.curveType, &P_);
+		mcl::initCurve<G1>(curveType, &P_);
 		setRangeForG1DLP(hashSize);
 		useDecG1ViaGT_ = false;
 		useDecG2ViaGT_ = false;
 		isG1only_ = true;
 		setTryNum(tryNum);
+	}
+	static void initG1only(const mcl::EcParam& para, size_t hashSize = local::defaultHashSize, size_t tryNum = local::defaultTryNum)
+	{
+		initG1only(para.curveType, hashSize, tryNum);
 	}
 	/*
 		set range for G1-DLP
@@ -741,10 +799,10 @@ public:
 			v *= c.g_[0];
 		}
 	public:
-		void setByCSPRNG()
+		void setByCSPRNG(fp::RandGen rg = fp::RandGen())
 		{
-			x_.setRand();
-			if (!isG1only_) y_.setRand();
+			x_.setRand(rg);
+			if (!isG1only_) y_.setRand(rg);
 		}
 		/*
 			set xP and yQ
@@ -774,7 +832,7 @@ public:
 #endif
 		int64_t dec(const CipherTextG1& c, bool *pok = 0) const
 		{
-			if (useDecG1ViaGT_) return decViaGT(c);
+			if (useDecG1ViaGT_) return decViaGT(c, pok);
 			/*
 				S = mP + rxP
 				T = rP
@@ -787,7 +845,7 @@ public:
 		}
 		int64_t dec(const CipherTextG2& c, bool *pok = 0) const
 		{
-			if (useDecG2ViaGT_) return decViaGT(c);
+			if (useDecG2ViaGT_) return decViaGT(c, pok);
 			G2 R;
 			G2::mul(R, c.T_, y_);
 			G2::sub(R, c.S_, R);
@@ -1026,9 +1084,9 @@ private:
 		s[m] = r + d[m] encRand
 	*/
 	template<class G, class I, class MulG>
-	static void makeZkpBin(ZkpBin& zkp, const G& S, const G& T, const Fr& encRand, const G& P, int m, const mcl::fp::WindowMethod<I>& Pmul, const MulG& xPmul)
+	static bool makeZkpBin(ZkpBin& zkp, const G& S, const G& T, const Fr& encRand, const G& P, int m, const mcl::fp::WindowMethod<I>& Pmul, const MulG& xPmul)
 	{
-		if (m != 0 && m != 1) throw cybozu::Exception("makeZkpBin:bad m") << m;
+		if (m != 0 && m != 1) return false;
 		Fr *s = &zkp.d_[0];
 		Fr *d = &zkp.d_[2];
 		G R[2][2];
@@ -1056,6 +1114,7 @@ private:
 		hash.get(c);
 		d[m] = c - d[1-m];
 		s[m] = r + d[m] * encRand;
+		return true;
 	}
 	/*
 		R[0][i] = s[i] P - d[i] T ; i = 0,1
@@ -1088,6 +1147,103 @@ private:
 		hash << S << T << R[0][0] << R[0][1] << R[1][0] << R[1][1];
 		hash.get(c);
 		return c == d[0] + d[1];
+	}
+	// check m[i] < m[i+1]
+	static bool check_mVec(const int *mVec, size_t mSize)
+	{
+		if (mSize < 1) return false;
+		for (size_t i = 0; i < mSize - 1; i++) {
+			if (mVec[i] >= mVec[i + 1]) return false;
+		}
+		return true;
+	}
+	/*
+		Enc(m; encRand) = (S, T)
+		make ZKP for m in M := mVec[0, mSize)
+		@note zkp has (mSize * 2) elements
+		@note M must satisfy the following properties:
+		1) m[i] < m[i+1] for all i < mSize - 1
+		2) i0 exists such that m[i0] = m
+	*/
+	template<class G, class I, class MulG>
+	static bool makeZkpSet(Fr *zkp, const G& xP, const G& S, const G& T, const Fr& encRand, int m, const int *mVec, size_t mSize, const mcl::fp::WindowMethod<I>& Pmul, const MulG& xPmul)
+	{
+		if (!check_mVec(mVec, mSize)) return false;
+		// find i0 s.t. m[i0] = m
+		size_t i0 = mSize;
+		for (size_t i = 0; i < mSize; i++) {
+			if (mVec[i] == m) {
+				i0 = i;
+				break;
+			}
+		}
+		if (i0 == mSize) return false;
+		Fr *const a = zkp;
+		Fr *const t = zkp + mSize;
+		for (size_t i = 0; i < mSize; i++) {
+			if (i != i0) {
+				a[i].setRand();
+			}
+			t[i].setRand();
+		}
+		local::Hash hash;
+		hash << xP << S << T;
+		Fr sum = 0;
+		for (size_t i = 0; i < mSize; i++) {
+			Fr u;
+			if (i == i0) {
+				u.clear();
+			} else {
+				u = a[i];
+				u *= (m - mVec[i]);
+				sum += a[i];
+			}
+			G R1, R2;
+			ElGamalEnc(R1, R2, u, Pmul, xPmul, &t[i]);
+			hash << R1 << R2;
+			if (i != i0) {
+				// b[i] = t[i] - a[i] r
+				t[i] -= a[i] * encRand;
+			}
+		}
+		Fr h;
+		hash.get(h); // h = Hash((S, T), {R_i})
+		a[i0] = h - sum;
+		t[i0] -= a[i0] * encRand;
+		return true;
+	}
+	/*
+		verify ZKP with Dec(S, T) in mVec[0, mSize)
+		@note zkp has (mSize * 2) elements
+		see https://github.com/herumi/mcl/blob/master/misc/she/nizkp.pdf
+	*/
+	template<class G, class I, class MulG>
+	static bool verifyZkpSet(const G& xP, const G& S, const G& T, const Fr *zkp, const int *mVec, size_t mSize, const mcl::fp::WindowMethod<I>& Pmul, const MulG& xPmul)
+	{
+		if (!check_mVec(mVec, mSize)) return false;
+		const Fr *a = zkp;
+		const Fr *b = zkp + mSize;
+		Fr c;
+		local::Hash hash;
+		hash << xP << S << T;
+		/*
+			ai(C - Enc(mi, 0)) - Enc(0, bi)
+			= ai(S - mi P, T) - (bi xP, bi P)
+		*/
+		Fr sum = 0;
+		for (size_t i = 0; i < mSize; i++) {
+			G1 S1, S2, T1, T2;
+			Pmul.mul(static_cast<I&>(S1), mVec[i]);
+			xPmul.mul(S2, b[i]);
+			Pmul.mul(static_cast<I&>(T2), b[i]);
+			S1 = (S - S1) * a[i] + S2;
+			T1 = T * a[i] + T2;
+			hash << S1 << T1;
+			sum += a[i];
+		}
+		Fr h;
+		hash.get(h);
+		return h == sum;
 	}
 	/*
 		encRand1, encRand2 are random values use for ElGamalEnc()
@@ -1151,9 +1307,9 @@ private:
 		encRand1, encRand2 are random values use for ElGamalEnc()
 	*/
 	template<class G1, class G2, class I1, class I2, class MulG1, class MulG2>
-	static void makeZkpBinEq(ZkpBinEq& zkp, G1& S1, G1& T1, G2& S2, G2& T2, int m, const mcl::fp::WindowMethod<I1>& Pmul, const MulG1& xPmul, const mcl::fp::WindowMethod<I2>& Qmul, const MulG2& yQmul)
+	static bool makeZkpBinEq(ZkpBinEq& zkp, G1& S1, G1& T1, G2& S2, G2& T2, int m, const mcl::fp::WindowMethod<I1>& Pmul, const MulG1& xPmul, const mcl::fp::WindowMethod<I2>& Qmul, const MulG2& yQmul)
 	{
-		if (m != 0 && m != 1) throw cybozu::Exception("makeZkpBinEq:bad m") << m;
+		if (m != 0 && m != 1) return false;
 		Fr *d = &zkp.d_[0];
 		Fr *spm = &zkp.d_[2];
 		Fr& ss = zkp.d_[4];
@@ -1201,6 +1357,7 @@ private:
 		ss += rs;
 		Fr::mul(sm, c, m);
 		sm += rm;
+		return true;
 	}
 	template<class G1, class G2, class I1, class I2, class MulG1, class MulG2>
 	static bool verifyZkpBinEq(const ZkpBinEq& zkp, const G1& S1, const G1& T1, const G2& S2, const G2& T2, const mcl::fp::WindowMethod<I1>& Pmul, const MulG1& xPmul, const mcl::fp::WindowMethod<I2>& Qmul, const MulG2& yQmul)
@@ -1389,21 +1546,53 @@ public:
 			pairing(aux.R_[2], P_, yQ_);
 			pairing(aux.R_[3], xP_, yQ_);
 		}
-		void encWithZkpBin(CipherTextG1& c, ZkpBin& zkp, int m) const
+		void encWithZkpBin(bool *pb, CipherTextG1& c, ZkpBin& zkp, int m) const
 		{
 			Fr encRand;
 			encRand.setRand();
 			const MulG<G1> xPmul(xP_);
 			ElGamalEnc(c.S_, c.T_, m, PhashTbl_.getWM(), xPmul, &encRand);
-			makeZkpBin(zkp, c.S_, c.T_, encRand, P_, m,  PhashTbl_.getWM(), xPmul);
+			*pb = makeZkpBin(zkp, c.S_, c.T_, encRand, P_, m,  PhashTbl_.getWM(), xPmul);
 		}
-		void encWithZkpBin(CipherTextG2& c, ZkpBin& zkp, int m) const
+		void encWithZkpBin(CipherTextG1& c, ZkpBin& zkp, int m) const
+		{
+			bool b;
+			encWithZkpBin(&b, c, zkp, m);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpBin:bad G1 m") << m;
+			}
+		}
+		void encWithZkpBin(bool *pb, CipherTextG2& c, ZkpBin& zkp, int m) const
 		{
 			Fr encRand;
 			encRand.setRand();
 			const MulG<G2> yQmul(yQ_);
 			ElGamalEnc(c.S_, c.T_, m, QhashTbl_.getWM(), yQmul, &encRand);
-			makeZkpBin(zkp, c.S_, c.T_, encRand, Q_, m,  QhashTbl_.getWM(), yQmul);
+			*pb = makeZkpBin(zkp, c.S_, c.T_, encRand, Q_, m,  QhashTbl_.getWM(), yQmul);
+		}
+		void encWithZkpBin(CipherTextG2& c, ZkpBin& zkp, int m) const
+		{
+			bool b;
+			encWithZkpBin(&b, c, zkp, m);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpBin:bad G2 m") << m;
+			}
+		}
+		void encWithZkpSet(bool *pb, CipherTextG1& c, Fr *zkp, int m, const int *mVec, size_t mSize) const
+		{
+			Fr encRand;
+			encRand.setRand();
+			const MulG<G1> xPmul(xP_);
+			ElGamalEnc(c.S_, c.T_, m, PhashTbl_.getWM(), xPmul, &encRand);
+			*pb = makeZkpSet(zkp, P_, c.S_, c.T_, encRand, m,  mVec, mSize, PhashTbl_.getWM(), xPmul);
+		}
+		void encWithZkpSet(CipherTextG1& c, Fr *zkp, int m, const int *mVec, size_t mSize) const
+		{
+			bool b;
+			encWithZkpSet(&b, c, zkp, m, mVec, mSize);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpSet:bad mVec") << mSize;
+			}
 		}
 		bool verify(const CipherTextG1& c, const ZkpBin& zkp) const
 		{
@@ -1442,6 +1631,11 @@ public:
 			const MulG<G2> yQmul(yQ_);
 			return verifyZkpBin(c.S_, c.T_, Q_, zkp, QhashTbl_.getWM(), yQmul);
 		}
+		bool verify(const CipherTextG1& c, const Fr *zkp, const int *mVec, size_t mSize) const
+		{
+			const MulG<G1> xPmul(xP_);
+			return verifyZkpSet(P_, c.S_, c.T_, zkp, mVec, mSize, PhashTbl_.getWM(), xPmul);
+		}
 		template<class INT>
 		void encWithZkpEq(CipherTextG1& c1, CipherTextG2& c2, ZkpEq& zkp, const INT& m) const
 		{
@@ -1455,11 +1649,19 @@ public:
 			const MulG<G2> yQmul(yQ_);
 			return verifyZkpEq(zkp, c1.S_, c1.T_, c2.S_, c2.T_, PhashTbl_.getWM(), xPmul, QhashTbl_.getWM(), yQmul);
 		}
-		void encWithZkpBinEq(CipherTextG1& c1, CipherTextG2& c2, ZkpBinEq& zkp, int m) const
+		void encWithZkpBinEq(bool *pb, CipherTextG1& c1, CipherTextG2& c2, ZkpBinEq& zkp, int m) const
 		{
 			const MulG<G1> xPmul(xP_);
 			const MulG<G2> yQmul(yQ_);
-			makeZkpBinEq(zkp, c1.S_, c1.T_, c2.S_, c2.T_, m, PhashTbl_.getWM(), xPmul, QhashTbl_.getWM(), yQmul);
+			*pb = makeZkpBinEq(zkp, c1.S_, c1.T_, c2.S_, c2.T_, m, PhashTbl_.getWM(), xPmul, QhashTbl_.getWM(), yQmul);
+		}
+		void encWithZkpBinEq(CipherTextG1& c1, CipherTextG2& c2, ZkpBinEq& zkp, int m) const
+		{
+			bool b;
+			encWithZkpBinEq(&b, c1, c2, zkp, m);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpBinEq:bad m") << m;
+			}
 		}
 		bool verify(const CipherTextG1& c1, const CipherTextG2& c2, const ZkpBinEq& zkp) const
 		{
@@ -1619,19 +1821,50 @@ public:
 			eyPQwm_.init(static_cast<const GTasEC&>(eyPQ_), bitSize, local::winSize);
 			exyPQwm_.init(static_cast<const GTasEC&>(exyPQ_), bitSize, local::winSize);
 		}
-		void encWithZkpBin(CipherTextG1& c, ZkpBin& zkp, int m) const
+		void encWithZkpBin(bool *pb, CipherTextG1& c, ZkpBin& zkp, int m) const
 		{
 			Fr encRand;
 			encRand.setRand();
 			ElGamalEnc(c.S_, c.T_, m, PhashTbl_.getWM(), xPwm_, &encRand);
-			makeZkpBin(zkp, c.S_, c.T_, encRand, P_, m,  PhashTbl_.getWM(), xPwm_);
+			*pb = makeZkpBin(zkp, c.S_, c.T_, encRand, P_, m,  PhashTbl_.getWM(), xPwm_);
 		}
-		void encWithZkpBin(CipherTextG2& c, ZkpBin& zkp, int m) const
+		void encWithZkpBin(CipherTextG1& c, ZkpBin& zkp, int m) const
+		{
+			bool b;
+			encWithZkpBin(&b, c, zkp, m);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpBin:bad G1 m") << m;
+			}
+		}
+		void encWithZkpBin(bool *pb, CipherTextG2& c, ZkpBin& zkp, int m) const
 		{
 			Fr encRand;
 			encRand.setRand();
 			ElGamalEnc(c.S_, c.T_, m, QhashTbl_.getWM(), yQwm_, &encRand);
-			makeZkpBin(zkp, c.S_, c.T_, encRand, Q_, m,  QhashTbl_.getWM(), yQwm_);
+			*pb = makeZkpBin(zkp, c.S_, c.T_, encRand, Q_, m,  QhashTbl_.getWM(), yQwm_);
+		}
+		void encWithZkpBin(CipherTextG2& c, ZkpBin& zkp, int m) const
+		{
+			bool b;
+			encWithZkpBin(&b, c, zkp, m);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpBin:bad G2 m") << m;
+			}
+		}
+		void encWithZkpSet(bool *pb, CipherTextG1& c, Fr *zkp, int m, const int *mVec, size_t mSize) const
+		{
+			Fr encRand;
+			encRand.setRand();
+			ElGamalEnc(c.S_, c.T_, m, PhashTbl_.getWM(), xPwm_, &encRand);
+			*pb = makeZkpSet(zkp, xPwm_.tbl_[1], c.S_, c.T_, encRand, m,  mVec, mSize, PhashTbl_.getWM(), xPwm_);
+		}
+		void encWithZkpSet(CipherTextG1& c, Fr *zkp, int m, const int *mVec, size_t mSize) const
+		{
+			bool b;
+			encWithZkpSet(&b, c, zkp, m, mVec, mSize);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpSet:bad mVec") << mSize;
+			}
 		}
 		bool verify(const CipherTextG1& c, const ZkpBin& zkp) const
 		{
@@ -1640,6 +1873,10 @@ public:
 		bool verify(const CipherTextG2& c, const ZkpBin& zkp) const
 		{
 			return verifyZkpBin(c.S_, c.T_, Q_, zkp, QhashTbl_.getWM(), yQwm_);
+		}
+		bool verify(const CipherTextG1& c, const Fr *zkp, const int *mVec, size_t mSize) const
+		{
+			return verifyZkpSet(xPwm_.tbl_[1], c.S_, c.T_, zkp, mVec, mSize, PhashTbl_.getWM(), xPwm_);
 		}
 		template<class INT>
 		void encWithZkpEq(CipherTextG1& c1, CipherTextG2& c2, ZkpEq& zkp, const INT& m) const
@@ -1650,9 +1887,17 @@ public:
 		{
 			return verifyZkpEq(zkp, c1.S_, c1.T_, c2.S_, c2.T_, PhashTbl_.getWM(), xPwm_, QhashTbl_.getWM(), yQwm_);
 		}
+		void encWithZkpBinEq(bool *pb, CipherTextG1& c1, CipherTextG2& c2, ZkpBinEq& zkp, int m) const
+		{
+			*pb = makeZkpBinEq(zkp, c1.S_, c1.T_, c2.S_, c2.T_, m, PhashTbl_.getWM(), xPwm_, QhashTbl_.getWM(), yQwm_);
+		}
 		void encWithZkpBinEq(CipherTextG1& c1, CipherTextG2& c2, ZkpBinEq& zkp, int m) const
 		{
-			makeZkpBinEq(zkp, c1.S_, c1.T_, c2.S_, c2.T_, m, PhashTbl_.getWM(), xPwm_, QhashTbl_.getWM(), yQwm_);
+			bool b;
+			encWithZkpBinEq(&b, c1, c2, zkp, m);
+			if (!b) {
+				throw cybozu::Exception("encWithZkpBinEq:bad m") << m;
+			}
 		}
 		bool verify(const CipherTextG1& c1, const CipherTextG2& c2, const ZkpBinEq& zkp) const
 		{
@@ -2050,15 +2295,18 @@ typedef SHE::ZkpDec ZkpDec;
 typedef SHE::AuxiliaryForZkpDecGT AuxiliaryForZkpDecGT;
 typedef SHE::ZkpDecGT ZkpDecGT;
 
-inline void init(const mcl::CurveParam& cp = mcl::BN254, size_t hashSize = 1024, size_t tryNum = local::defaultTryNum)
+inline void init(const mcl::CurveParam& cp = mcl::BN254, size_t hashSize = local::defaultHashSize, size_t tryNum = local::defaultTryNum)
 {
 	SHE::init(cp, hashSize, tryNum);
 }
-inline void initG1only(const mcl::EcParam& para, size_t hashSize = 1024, size_t tryNum = local::defaultTryNum)
+inline void initG1only(int curveType, size_t hashSize = local::defaultHashSize, size_t tryNum = local::defaultTryNum)
 {
-	SHE::initG1only(para, hashSize, tryNum);
+	SHE::initG1only(curveType, hashSize, tryNum);
 }
-inline void init(size_t hashSize, size_t tryNum = local::defaultTryNum) { SHE::init(hashSize, tryNum); }
+inline void initG1only(const mcl::EcParam& para, size_t hashSize = local::defaultHashSize, size_t tryNum = local::defaultTryNum)
+{
+	initG1only(para.curveType, hashSize, tryNum);
+}
 inline void setRangeForG1DLP(size_t hashSize) { SHE::setRangeForG1DLP(hashSize); }
 inline void setRangeForG2DLP(size_t hashSize) { SHE::setRangeForG2DLP(hashSize); }
 inline void setRangeForGTDLP(size_t hashSize) { SHE::setRangeForGTDLP(hashSize); }
@@ -2096,6 +2344,53 @@ inline void mul(CipherText& z, const CipherText& x, const INT& y) { CipherText::
 
 inline void mul(CipherTextGT& z, const CipherTextG1& x, const CipherTextG2& y) { CipherTextGT::mul(z, x, y); }
 inline void mul(CipherText& z, const CipherText& x, const CipherText& y) { CipherText::mul(z, x, y); }
+
+template<class G>
+void normalizeVec(SHE::CipherTextAT<G> *v, size_t n)
+{
+	typedef SHE::CipherTextAT<G> Cipher;
+	typedef local::CipherAsArrayOfEc<Cipher> Array;
+	Array arr(v);
+	ec::local::normalizeVecT<typename G::Fp, Array, Array, local::AsArrayOfFp<Array> >(arr, arr, n * 2);
+}
+
+template<class OutputStream, class G>
+void serializeVecToAffine(OutputStream& os, SHE::CipherTextAT<G> *v, size_t n)
+{
+	normalizeVec(v, n);
+#if 1
+	for (size_t i = 0; i < n; i++) {
+		v[i].save(os, IoEcAffineSerialize);
+	}
+#else
+	const size_t bufSize = sizeof(typename G::Fp) * 2 /* affine */ * 2 /* (S, T) */ * n;
+	uint8_t *buf = (uint8_t*)CYBOZU_ALLOCA(bufSize);
+	cybozu::MemoryOutputStream mos(buf, bufSize);
+	for (size_t i = 0; i < n; i++) {
+		v[i].save(mos, IoEcAffineSerialize);
+	}
+	assert(mos.getPos() == bufSize);
+	cybozu::write(os, buf, bufSize);
+#endif
+}
+
+template<class InputStream, class G>
+void deserializeVecFromAffine(SHE::CipherTextAT<G> *v, size_t n, InputStream& is)
+{
+#if 1
+	for (size_t i = 0; i < n; i++) {
+		v[i].load(is, IoEcAffineSerialize);
+	}
+#else
+	const size_t bufSize = sizeof(typename G::Fp) * 2 /* affine */ * 2 /* (S, T) */ * n;
+	uint8_t *buf = (uint8_t*)CYBOZU_ALLOCA(bufSize);
+	cybozu::read(buf, bufSize, is);
+	cybozu::MemoryInputStream mis(buf, bufSize);
+	for (size_t i = 0; i < n; i++) {
+		v[i].load(mis, IoEcAffineSerialize);
+	}
+#endif
+}
 
 } } // mcl::she
 

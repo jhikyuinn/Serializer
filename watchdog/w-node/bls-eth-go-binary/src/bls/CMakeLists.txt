@@ -40,7 +40,7 @@ if(MSVC)
 	endif()
 else()
 	if("${CFLAGS_OPT_USER}" STREQUAL "")
-		set(CFLAGS_OPT_USER "-O3 -DNDEBUG -march=native")
+		set(CFLAGS_OPT_USER "-O3 -DNDEBUG")
 	endif()
 	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wformat=2 -Wcast-qual -Wcast-align -Wwrite-strings -Wfloat-equal -Wpointer-arith ${CFLAGS_OPT_USER}")
 	set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS}")
@@ -55,7 +55,7 @@ foreach(bit IN ITEMS 256 384 384_256)
 	target_include_directories(bls${bit} PUBLIC
 		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 		$<INSTALL_INTERFACE:${CMAKE_INSTALL_DIR}/include>)
-	target_link_libraries(bls${bit} PUBLIC mcl::mclbn${bit})
+	target_link_libraries(bls${bit} PUBLIC mcl::mcl mcl::mcl_st mcl::mclbn${bit})
 	set_target_properties(bls${bit} PROPERTIES
 	  POSITION_INDEPENDENT_CODE ON
 	  VERSION ${bls_VERSION}
@@ -81,8 +81,7 @@ set(CMAKE_EXPORT_PACKAGE_REGISTERY ON)
 export(PACKAGE bls)
 
 # Tests
-if((CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR BLS_BUILD_TESTING)
-	AND BUILD_TESTING)
+if(BLS_BUILD_TESTING)
 	enable_testing()
 	add_subdirectory(test)
 endif()

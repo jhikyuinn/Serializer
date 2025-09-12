@@ -5,18 +5,8 @@
 #include <mcl/ecparam.hpp>
 #include <cybozu/test.hpp>
 #include <iostream>
+#include <vector>
 #include <mcl/gmp_util.hpp>
-
-template<size_t N>
-std::ostream& dump(std::ostream& os, const uint64_t (&x)[N])
-{
-	for (size_t i = 0; i < N; i++) {
-		char buf[64];
-		CYBOZU_SNPRINTF(buf, sizeof(buf), "%016llx", (long long)x[i]);
-		os << buf;
-	}
-	return os;
-}
 
 CYBOZU_TEST_AUTO(init)
 {
@@ -135,6 +125,99 @@ CYBOZU_TEST_AUTO(Fr)
 		mclBnFr_getStr(buf, sizeof(buf), &x, 16);
 		printf("%s\n", buf);
 	}
+	mclBnFr_setInt(&x, 10);
+	mclBnFr_setInt(&y, 5);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&x, &y), 1);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&x, &x), 0);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&y, &y), 0);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&y, &x), -1);
+	mclBnFr_setInt(&y, -10); // large value
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&x, &y), -1);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&x, &x), 0);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&y, &y), 0);
+	CYBOZU_TEST_EQUAL(mclBnFr_cmp(&y, &x), 1);
+}
+
+CYBOZU_TEST_AUTO(Fr_pow)
+{
+	mclBnFr x, y, z1, z2, z3;
+	const char *s = "123456789123456789123";
+	CYBOZU_TEST_ASSERT(!mclBnFr_setStr(&x, s, strlen(s), 10));
+	mclBnFr_setInt(&z1, 1);
+	// small pow
+	for (uint8_t i = 0; i < 100; i++) {
+		CYBOZU_TEST_ASSERT(!mclBnFr_powArray(&z2, &x, &i, 1));
+		CYBOZU_TEST_ASSERT(mclBnFr_isEqual(&z1, &z2));
+		mclBnFr_setInt(&y, i);
+		mclBnFr_pow(&z3, &x, &y);
+		CYBOZU_TEST_ASSERT(mclBnFr_isEqual(&z1, &z3));
+		mclBnFr_mul(&z1, &z1, &x);
+	}
+	mclBnFr one, negOne;
+	mclBnFr_setInt(&one, 1);
+	mclBnFr_setInt(&negOne, -1); // p-1
+	// large pow
+	y = z1;
+	for (int i = 0; i < 100; i++) {
+		uint8_t yBuf[64];
+		size_t yn = mclBnFr_getLittleEndian(yBuf, sizeof(yBuf), &y);
+		CYBOZU_TEST_ASSERT(yn > 0);
+		mclBnFr_powArray(&z1, &x, yBuf, yn); // z1 = x^{y}
+		mclBnFr_pow(&z3, &x, &y);
+		CYBOZU_TEST_ASSERT(mclBnFr_isEqual(&z1, &z3));
+		mclBnFr_sub(&y, &negOne, &y); // y = p-1-y
+		yn = mclBnFr_getLittleEndian(yBuf, sizeof(yBuf), &y);
+		mclBnFr_powArray(&z2, &x, yBuf, yn); // z2 = x^{p-1-y}
+		mclBnFr_mul(&z1, &z1, &z2);
+		// x^{p-1} = 1 mod p
+		CYBOZU_TEST_ASSERT(mclBnFr_isEqual(&z1, &one));
+	}
+	// err
+	{
+		uint8_t buf[100] = {};
+		CYBOZU_TEST_ASSERT(mclBnFr_powArray(&x, &x, buf, sizeof(buf)) < 0);
+	}
+}
+
+CYBOZU_TEST_AUTO(Fp_pow)
+{
+	mclBnFp x, y, z1, z2, z3;
+	const char *s = "123456789123456789123";
+	CYBOZU_TEST_ASSERT(!mclBnFp_setStr(&x, s, strlen(s), 10));
+	mclBnFp_setInt(&z1, 1);
+	// small pow
+	for (uint8_t i = 0; i < 100; i++) {
+		CYBOZU_TEST_ASSERT(!mclBnFp_powArray(&z2, &x, &i, 1));
+		CYBOZU_TEST_ASSERT(mclBnFp_isEqual(&z1, &z2));
+		mclBnFp_setInt(&y, i);
+		mclBnFp_pow(&z3, &x, &y);
+		CYBOZU_TEST_ASSERT(mclBnFp_isEqual(&z1, &z3));
+		mclBnFp_mul(&z1, &z1, &x);
+	}
+	mclBnFp one, negOne;
+	mclBnFp_setInt(&one, 1);
+	mclBnFp_setInt(&negOne, -1); // p-1
+	// large pow
+	y = z1;
+	for (int i = 0; i < 100; i++) {
+		uint8_t yBuf[64];
+		size_t yn = mclBnFp_getLittleEndian(yBuf, sizeof(yBuf), &y);
+		CYBOZU_TEST_ASSERT(yn > 0);
+		mclBnFp_powArray(&z1, &x, yBuf, yn); // z1 = x^{y}
+		mclBnFp_pow(&z3, &x, &y);
+		CYBOZU_TEST_ASSERT(mclBnFp_isEqual(&z1, &z3));
+		mclBnFp_sub(&y, &negOne, &y); // y = p-1-y
+		yn = mclBnFp_getLittleEndian(yBuf, sizeof(yBuf), &y);
+		mclBnFp_powArray(&z2, &x, yBuf, yn); // z2 = x^{p-1-y}
+		mclBnFp_mul(&z1, &z1, &z2);
+		// x^{p-1} = 1 mod p
+		CYBOZU_TEST_ASSERT(mclBnFp_isEqual(&z1, &one));
+	}
+	// err
+	{
+		uint8_t buf[100] = {};
+		CYBOZU_TEST_ASSERT(mclBnFp_powArray(&x, &x, buf, sizeof(buf)) < 0);
+	}
 }
 
 void G1test()
@@ -179,6 +262,18 @@ void G1test()
 	CYBOZU_TEST_ASSERT(mclBnG1_isEqual(&x, &z));
 	mclBnG1_normalize(&y, &z);
 	CYBOZU_TEST_ASSERT(mclBnG1_isEqual(&y, &z));
+	const size_t N = 10;
+	mclBnG1 v1[N], v2[N];
+	mclBnG1_dbl(&v1[0], &z);
+	for (size_t i = 1; i < N; i++) {
+		mclBnG1_add(&v1[i], &v1[i-1], &y);
+	}
+	mclBnG1_clear(&v1[N/2]);
+	mclBnG1_normalizeVec(v2, v1, N);
+	for (size_t i = 0; i < N; i++) {
+		CYBOZU_TEST_ASSERT(mclBnG1_isEqual(&v1[i], &v2[i]));
+		CYBOZU_TEST_ASSERT(mclBnFp_isOne(&v2[i].z) || mclBnFp_isZero(&v2[i].z));
+	}
 }
 
 CYBOZU_TEST_AUTO(G1)
@@ -228,6 +323,18 @@ CYBOZU_TEST_AUTO(G2)
 	CYBOZU_TEST_ASSERT(mclBnG2_isEqual(&x, &z));
 	mclBnG2_normalize(&y, &z);
 	CYBOZU_TEST_ASSERT(mclBnG2_isEqual(&y, &z));
+	const size_t N = 10;
+	mclBnG2 v1[N], v2[N];
+	mclBnG2_dbl(&v1[0], &z);
+	for (size_t i = 1; i < N; i++) {
+		mclBnG2_add(&v1[i], &v1[i-1], &y);
+	}
+	mclBnG2_clear(&v1[N/2]);
+	mclBnG2_normalizeVec(v2, v1, N);
+	for (size_t i = 0; i < N; i++) {
+		CYBOZU_TEST_ASSERT(mclBnG2_isEqual(&v1[i], &v2[i]));
+		CYBOZU_TEST_ASSERT(mclBnFp2_isOne(&v2[i].z) || mclBnFp2_isZero(&v2[i].z));
+	}
 }
 
 CYBOZU_TEST_AUTO(GT)
@@ -330,6 +437,74 @@ CYBOZU_TEST_AUTO(GT_inv)
 	CYBOZU_TEST_ASSERT(mclBnGT_isOne(&e4));
 }
 
+CYBOZU_TEST_AUTO(Fp_invVec)
+{
+	const size_t n = 1024;
+	mclBnFr x[n], y[n];
+	mclBnFr_setInt(&x[0], 1234567);
+	for (size_t i = 1; i < n; i++) {
+		mclBnFr_sqr(&x[i], &x[i-1]);
+	}
+	const size_t zeroTbl[] = { 10, 20, 30, 40 };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(zeroTbl); i++) {
+		mclBnFr_clear(&x[zeroTbl[i]]);
+	}
+	const size_t oneTbl[] = { 100, 200, 300 };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(oneTbl); i++) {
+		mclBnFr_setInt(&x[oneTbl[i]], 1);
+	}
+	size_t doneN = mclBnFr_invVec(y, x, n);
+	size_t c = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (mclBnFr_isZero(&x[i])) {
+			CYBOZU_TEST_ASSERT(mclBnFr_isZero(&y[i]));
+			c++;
+		} else if (mclBnFr_isOne(&x[i])) {
+			CYBOZU_TEST_ASSERT(mclBnFr_isOne(&y[i]));
+			c++;
+		} else {
+			mclBnFr t;
+			mclBnFr_mul(&t, &x[i], &y[i]);
+			CYBOZU_TEST_ASSERT(mclBnFr_isOne(&t));
+		}
+	}
+	CYBOZU_TEST_EQUAL(doneN, n-c);
+}
+
+CYBOZU_TEST_AUTO(Fr_invVec)
+{
+	const size_t n = 1024;
+	mclBnFr x[n], y[n];
+	mclBnFr_setInt(&x[0], 1234567);
+	for (size_t i = 1; i < n; i++) {
+		mclBnFr_sqr(&x[i], &x[i-1]);
+	}
+	const size_t zeroTbl[] = { 10, 20, 30, 40 };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(zeroTbl); i++) {
+		mclBnFr_clear(&x[zeroTbl[i]]);
+	}
+	const size_t oneTbl[] = { 100, 200, 300 };
+	for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(oneTbl); i++) {
+		mclBnFr_setInt(&x[oneTbl[i]], 1);
+	}
+	size_t doneN = mclBnFr_invVec(y, x, n);
+	size_t c = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (mclBnFr_isZero(&x[i])) {
+			CYBOZU_TEST_ASSERT(mclBnFr_isZero(&y[i]));
+			c++;
+		} else if (mclBnFr_isOne(&x[i])) {
+			CYBOZU_TEST_ASSERT(mclBnFr_isOne(&y[i]));
+			c++;
+		} else {
+			mclBnFr t;
+			mclBnFr_mul(&t, &x[i], &y[i]);
+			CYBOZU_TEST_ASSERT(mclBnFr_isOne(&t));
+		}
+	}
+	CYBOZU_TEST_EQUAL(doneN, n-c);
+}
+
 CYBOZU_TEST_AUTO(Fr_isNegative)
 {
 	mclBnFr a, half, one;
@@ -407,6 +582,10 @@ CYBOZU_TEST_AUTO(pairing)
 	mclBnGT_mul(&e2, &e, &e);
 	mclBnGT_mul(&e2, &e2, &e);
 	CYBOZU_TEST_ASSERT(mclBnGT_isEqual(&e1, &e2));
+
+	CYBOZU_TEST_ASSERT(mclBnGT_isValid(&e1));
+	e1.d[0].d[0]++;
+	CYBOZU_TEST_ASSERT(!mclBnGT_isValid(&e1));
 }
 
 CYBOZU_TEST_AUTO(precomputed)
@@ -463,6 +642,28 @@ CYBOZU_TEST_AUTO(millerLoopVec)
 	}
 	mclBn_millerLoopVec(&e1, Pvec, Qvec, n);
 	CYBOZU_TEST_ASSERT(mclBnGT_isEqual(&e1, &e2));
+}
+
+CYBOZU_TEST_AUTO(millerLoopVecMT)
+{
+	const size_t n = 10;
+	mclBnG1 Pvec[n];
+	mclBnG2 Qvec[n];
+	for (size_t i = 0; i < n; i++) {
+		char d = (char)(i + 1);
+		mclBnG1_hashAndMapTo(&Pvec[i], &d, 1);
+		mclBnG2_hashAndMapTo(&Qvec[i], &d, 1);
+	}
+	for (size_t cpuN = 0; cpuN < 4; cpuN++) {
+		mclBnGT e1, e2;
+		mclBnGT_setInt(&e2, 1);
+		for (size_t i = 0; i < n; i++) {
+			mclBn_millerLoop(&e1, &Pvec[i], &Qvec[i]);
+			mclBnGT_mul(&e2, &e2, &e1);
+		}
+		mclBn_millerLoopVecMT(&e1, Pvec, Qvec, n, cpuN);
+		CYBOZU_TEST_ASSERT(mclBnGT_isEqual(&e1, &e2));
+	}
 }
 
 CYBOZU_TEST_AUTO(serialize)
@@ -846,6 +1047,7 @@ CYBOZU_TEST_AUTO(Fp)
 	CYBOZU_TEST_ASSERT(mclBnFp_isOne(&x1));
 }
 
+#ifndef MCL_USE_VINT
 CYBOZU_TEST_AUTO(mod)
 {
 	{
@@ -855,7 +1057,7 @@ CYBOZU_TEST_AUTO(mod)
 		mpz_class p(buf);
 		mpz_class x = mpz_class(1) << (mclBn_getFpByteSize() * 2);
 		mclBnFp y;
-		int ret = mclBnFp_setLittleEndianMod(&y, mcl::gmp::getUnit(x), mcl::gmp::getUnitSize(x) * sizeof(void*));
+		int ret = mclBnFp_setLittleEndianMod(&y, mcl::gmp::getUnit(x), mcl::gmp::getUnitSize(x) * MCL_SIZEOF_UNIT);
 		CYBOZU_TEST_EQUAL(ret, 0);
 		mclBnFp_getStr(buf, sizeof(buf), &y, 10);
 		CYBOZU_TEST_EQUAL(mpz_class(buf), x % p);
@@ -867,12 +1069,13 @@ CYBOZU_TEST_AUTO(mod)
 		mpz_class p(buf);
 		mpz_class x = mpz_class(1) << (mclBn_getFrByteSize() * 2);
 		mclBnFr y;
-		int ret = mclBnFr_setLittleEndianMod(&y, mcl::gmp::getUnit(x), mcl::gmp::getUnitSize(x) * sizeof(void*));
+		int ret = mclBnFr_setLittleEndianMod(&y, mcl::gmp::getUnit(x), mcl::gmp::getUnitSize(x) * MCL_SIZEOF_UNIT);
 		CYBOZU_TEST_EQUAL(ret, 0);
 		mclBnFr_getStr(buf, sizeof(buf), &y, 10);
 		CYBOZU_TEST_EQUAL(mpz_class(buf), x % p);
 	}
 }
+#endif
 
 CYBOZU_TEST_AUTO(Fp2)
 {
@@ -1049,13 +1252,21 @@ CYBOZU_TEST_AUTO(mulVec)
 	for (size_t i = 0; i < N; i++) {
 		char c = char('a' + i);
 		mclBnG1_hashAndMapTo(&x1Vec[i], &c, 1);
+		if (i == 10) {
+			mclBnG1_clear(&x1Vec[i]); // x1Vec[i] contains zero
+		}
 		mclBnG2_hashAndMapTo(&x2Vec[i], &c, 1);
 		mclBn_pairing(&xtVec[i], &x1Vec[i], &x2Vec[i]);
-		mclBnFr_setByCSPRNG(&yVec[i]);
+//		mclBnFr_setByCSPRNG(&yVec[i]);
+		mclBnFr_setHashOf(&yVec[i], &c, 1);
 	}
+	mclBnG1 x1Vec2[N];
+	memcpy(x1Vec2, x1Vec, sizeof(x1Vec));
+
 	mclBnG1_mulVec(&z1, x1Vec, yVec, N);
 	mclBnG2_mulVec(&z2, x2Vec, yVec, N);
 	mclBnGT_powVec(&zt, xtVec, yVec, N);
+	mclBnG1_mulEach(x1Vec2, yVec, N);
 
 	mclBnG1_clear(&w1);
 	mclBnG2_clear(&w2);
@@ -1065,6 +1276,22 @@ CYBOZU_TEST_AUTO(mulVec)
 		mclBnG2 t2;
 		mclBnGT tt;
 		mclBnG1_mul(&t1, &x1Vec[i], &yVec[i]);
+		CYBOZU_TEST_ASSERT(mclBnG1_isEqual(&t1, &x1Vec2[i]));
+#if 0
+		if (mclBnG1_isEqual(&t1, &x1Vec2[i]) == 0) {
+			char buf[1024];
+			printf("i=%zd\n", i);
+			mclBnG1_getStr(buf, sizeof(buf), &x1Vec[i], 10);
+			printf("x1=%s\n", buf);
+			mclBnFr_getStr(buf, sizeof(buf), &yVec[i], 10);
+			printf("y=%s\n", buf);
+			mclBnG1_getStr(buf, sizeof(buf), &t1, 10);
+			printf("xy=%s\n", buf);
+			mclBnG1_getStr(buf, sizeof(buf), &x1Vec2[i], 10);
+			printf("ng=%s\n", buf);
+			exit(1);
+		}
+#endif
 		mclBnG2_mul(&t2, &x2Vec[i], &yVec[i]);
 		mclBnGT_pow(&tt, &xtVec[i], &yVec[i]);
 		mclBnG1_add(&w1, &w1, &t1);

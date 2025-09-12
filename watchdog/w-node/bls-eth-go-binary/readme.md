@@ -9,6 +9,8 @@ This repository contains compiled static library of https://github.com/herumi/bl
 * Sign; G2
 
 # News
+- 2023/Aug/17 The performance of Sign is a little improved.
+- 2023/Jun/12 move static libraries to release branch
 - 2021/Jan/28 (change specification) enable VerifySignatureOrder and VerifyPublicKeyOrder by default
 - 2021/Jan/28 (change specification) verify returns false for zero public key
 - 2021/Jan/02 support arm64 golang on M1 mac
@@ -50,30 +52,82 @@ Check functions:
 # How to run `examples/sample.go`
 
 ```
-go get github.com/herumi/bls-eth-go-binary/
+git clone -b release https://github.com/herumi/bls-eth-go-binary
+cd bls-eth-go-binary
 go run examples/sample.go
 ```
 
-# How to build the static library
-The following steps are not necessary if you use compiled binary in this repository.
+# How to use `setup_vendor.sh`
+Since this package includes C headers and libraries,
+when using `go build -mod=vendor`, please run:
+
+```bash
+$GOMODCACHE/github.com/herumi/bls-eth-go-binary@<version>/setup_vendor.sh
+```
+
+This command will copy all necessary files to your vendor directory.
+
+# How to build the static binary
+The following steps are not necessary if you use release branch.
+
+```
+git clone https://github.com/herumi/bls-eth-go-binary
+cd bls-eth-go-binary
+git submodule update --init --recursive
+go test ./bls
+```
 
 ## Linux, Mac, Windows(mingw64)
+On x64 Linux,
 ```
-git clone --recursive https://github.com/herumi/bls-eth-go-binary
-# git submodule update --init --recursive
-cd bls-eth-go-binary
+make
+```
+
+Otherwise, clang is necessary to build ll files.
+```
 make CXX=clang++
-go test ./bls -bench "Pairing|Sign|Verify"
 ```
 
-clang generates better binary than gcc.
+### Cross compile on macOS
 
-## Android
+```
+make ARCH=x86_64 # for Intel mac
+make ARCH=arm64  # for M1 mac
+```
+
+### Cross compile of aarch64 on x64 Linux
+
+```
+sudo apt-get install gcc-multilib
+make -C src/bls -f Makefile.onelib build_aarch64 CXX=clang++ -j OUT_DIR=../..
+```
+
+### Cross compile of RISC-V
+Install a cross compiler.
+```
+sudo apt install gcc-riscv64-linux-gnu
+```
+
+Build a library and run the sample.
+```
+make riscv64
+env CGO_ENABLED=1 GOARCH=riscv64 CC=riscv64-linux-gnu-gcc-14 go build examples/sample.go
+env QEMU_LD_PREFIX=/usr/riscv64-linux-gnu ./sample
+```
+
+# Android
+Install [ndk-build](https://developer.android.com/ndk/guides).
 ```
 make android
 ```
 
-## iOS
+If you need a shared library, then after `make clean`,
+
+```
+make android BLS_LIB_SHARED=1
+```
+
+# iOS
 ```
 make ios
 ```

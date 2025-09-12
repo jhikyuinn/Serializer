@@ -1,12 +1,10 @@
 package main
 
 import (
-	lg "auditchain/ledger"
-	pb "auditchain/msg"
-	wp2p "auditchain/wp2p"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
@@ -18,186 +16,97 @@ import (
 	"io"
 	"log"
 	"math/big"
-	rd "math/rand"
 	"net"
 	"net/http"
-	"os"
 	"regexp"
-	"runtime/metrics"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/BurntSushi/toml"
-	PuCtrl "github.com/MCNL-HGU/mp2btp/puctrl"
+	lg "auditchain/ledger"
+	pb "auditchain/msg"
+	wp2p "auditchain/wp2p"
+
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/herumi/bls-eth-go-binary/bls"
-	"github.com/hyperledger/fabric-protos-go/common"
-	"github.com/hyperledger/fabric/protoutil"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	quic "github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go"
 	"google.golang.org/grpc"
 )
 
-type Fabric struct {
-	Num          uint64
-	PreviousHash []byte
-	DataHash     []byte
-	Consensus    bool
-}
-
+// ======================= Structs =======================
 type CONSENSUSNODE struct {
-	wlog *log.Logger
+	address          string
+	selfId           string
+	roundIdx         uint32
+	members          []*pb.Wnode
+	isLeader         atomic.Bool
+	leader           bool
+	channelID        string
+	done             chan bool
+	pendingCommittee *pb.CommitteeMsg // 새 커미티 대기용
 
-	address   string
-	selfId    string
-	roundIdx  uint32
-	members   []*pb.Wnode
-	isLeader  atomic.Bool
-	leader    bool
-	channelID string
-	done      chan bool
-
-	blockMsg  *pb.TransactionMsg
-	memberMsg *pb.MemberMsg
-	auditMsg  *pb.AuditMsg
+	kafkaConsumer *kafka.Consumer
+	blockMsg      *pb.TransactionMsg
+	memberMsg     *pb.MemberMsg
+	auditMsg      *pb.AuditMsg
+	cancel        context.CancelFunc
+	isRunning     atomic.Bool
 }
 
+// ======================= Constants =======================
 const (
-	validatorIP          = "117.16.244.33"
-	validatorGrpcPort    = "16220"
-	validatorNatPort     = "11730"
-	gossipMsgPort        = ":4242"
-	consensusPort        = ":5252"
-	gossipListenPort     = ":6262"
-	prometheusListenPort = ":12345"
+	validatorIP       = "117.16.244.33"
+	validatorGrpcPort = "16220"
+	validatorNatPort  = "11730"
+	gossipMsgPort     = ":4242"
+	grpcPort          = ":5252"
+	gossipListenPort  = ":6262"
+	prometheusPort    = ":12345"
 )
 
 var (
 	validatorGrpcAddr = validatorIP + ":" + validatorGrpcPort
 	validatorNatAddr  = validatorIP + ":" + validatorNatPort
+	brokers           = ""
+	kafkaGroupID      = "MYGROUP1"
+	leaderChan        = ""
+	sec               bls.SecretKey
+	pub               *bls.PublicKey
+	sigVec            []bls.Sign
+	pubVec            []bls.PublicKey
 
-	brokers    = ""
-	leaderBro  = false
-	leaderChan = ""
+	mu sync.RWMutex
 
-	sec    bls.SecretKey
-	pub    *bls.PublicKey
-	sigVec []bls.Sign
-	pubVec []bls.PublicKey
+	ctx, cancel = context.WithCancel(context.Background())
 )
+var consensusStatusMap = make(map[string]bool)
 
-var MP2BTPsession *PuCtrl.PuCtrl
-
-// func getKafkaGroupID() string {
-// 	hostname, _ := os.Hostname()
-// 	groupID := "myGroup-" + hostname
-// 	if groupID == "" {
-// 		// 환경변수가 없으면 임시 로컬용 UUID 생성
-// 		groupID = "local-" + uuid.New().String()
-// 		fmt.Println("KAFKA_GROUP_ID not set, using local generated ID:", groupID)
-// 	}
-// 	return groupID
-// }
-
-func NewKafkaConsumer() *kafka.Consumer {
-	// kafkaGroupID := getKafkaGroupID()
-	kafkaGroupID := "MYGROUP"
-	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": brokers,
-		"group.id":          kafkaGroupID,
-		"auto.offset.reset": "earliest",
-	})
-	if err != nil {
-		log.Fatalf("Failed to create Kafka consumer: %v", err)
-	}
-	return c
-}
-
-var (
-	counter = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: "WDN_WNODE",
-		Name:      "wdn_counter_total",
-		Help:      "Total count of WDN events",
-	})
-
-	gauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "WDN_WNODE",
-		Name:      "wdn_gauge_value",
-		Help:      "Current gauge value of WDN",
-	})
-
-	histogram = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "WDN_WNODE",
-		Name:      "wdn_histogram_value",
-		Help:      "Histogram of WDN measurements",
-		Buckets:   prometheus.LinearBuckets(0, 5, 10), // 0~50까지 10버킷
-	})
-)
-
-func monitoring() {
-	const nGo = "/sched/goroutines:goroutines"
-	const nMem = "/memory/classes/heap/objects:bytes"
-
-	prometheus.MustRegister(counter)
-	prometheus.MustRegister(gauge)
-	prometheus.MustRegister(histogram)
-
-	getMetric := make([]metrics.Sample, 2)
-	getMetric[0].Name = nGo
-	getMetric[1].Name = nMem
-
-	go func() {
-		for {
-			counter.Add(rd.Float64() * 5)
-			gauge.Add(rd.Float64()*15 - 5)
-			histogram.Observe(rd.Float64() * 10)
-
-			metrics.Read(getMetric)
-			time.Sleep(2 * time.Second)
-		}
-	}()
-	fmt.Println(http.ListenAndServe(prometheusListenPort, nil))
-}
-
+// ======================= Main =======================
 func main() {
 	defaultValidatorAddr := flag.String("snode", "117.16.244.33", "Validator node IP address")
 	kafkaProcessorAddr := flag.String("broker", "117.16.244.33", "Kafka broker IP address")
-	libp2pAddr := flag.String("libp2p", "/ip4/117.16.244.33/tcp/4001/p2p/QmeD4iQQJAjoAvaTwT3UbFqSZ5zMWJne7dk7519H1A4ML5", "Libp2p multiaddress")
-	ami := flag.Bool("ami", false, "AMI mode (leader)")
+	libp2pAddr := flag.String("libp2p", "/ip4/117.16.244.33/tcp/4001/p2p/QmTZPpSK44fZpmQn5orB2zjMF4qVGrRm5H7MwNhwJJtLNP", "Libp2p multiaddress")
 	channel := flag.String("channel", "mychannel", "Channel name")
+	consensusProtocol := flag.Bool("networktype", false, "true = MP2BTP, false = QUIC")
 
 	flag.Parse()
 
 	validatorGrpcAddr = *defaultValidatorAddr + ":16220"
 	validatorNatAddr = *defaultValidatorAddr + ":11730"
-
 	brokers = *kafkaProcessorAddr + ":9091," + *kafkaProcessorAddr + ":9092," + *kafkaProcessorAddr + ":9093"
-	leaderBro = *ami
 	leaderChan = *channel
 
 	var consensusNode CONSENSUSNODE
-
-	logFile := "./wnode.log"
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Failed to open log file: %v\n", err)
-		return
-	}
-	defer f.Close()
-
 	consensusNode = CONSENSUSNODE{
-		wlog:      log.New(f, "WLog ", log.LstdFlags),
 		leader:    false,
 		done:      make(chan bool, 1),
 		blockMsg:  &pb.TransactionMsg{},
 		auditMsg:  &pb.AuditMsg{},
 		memberMsg: &pb.MemberMsg{},
 	}
-
-	consensusNode.wlog.Println("Start")
 
 	go wp2p.Start(true, *libp2pAddr, 4010)
 	time.Sleep(3 * time.Second)
@@ -211,233 +120,35 @@ func main() {
 	pub = sec.GetPublicKey()
 
 	http.Handle("/metrics", promhttp.Handler())
-	go monitoring()
+	// go monitoring()
 
 	wp2p.JoinShard(leaderChan)
 
-	consensusNode.start()
+	consensusNode.start(*consensusProtocol)
 }
-
-func (w *CONSENSUSNODE) GetAddress() string {
-	ifaces, err := net.Interfaces()
+func NewKafkaConsumer() *kafka.Consumer {
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers":    brokers,
+		"group.id":             kafkaGroupID,
+		"auto.offset.reset":    "earliest",
+		"session.timeout.ms":   30000,
+		"max.poll.interval.ms": 300000,
+		"fetch.wait.max.ms":    10,
+	})
 	if err != nil {
-		w.wlog.Printf("Failed to get network interfaces: %v", err)
-		return ""
+		log.Fatalf("Failed to create Kafka consumer: %v", err)
 	}
-
-	for _, iface := range ifaces {
-		// 도커 컨테이너 환경일 경우
-		if iface.Name == "eth0" {
-			// 로컬 환경일 경우
-			// if iface.Name == "eno1" {
-			addrs, err := iface.Addrs()
-			if err != nil {
-				w.wlog.Printf("Failed to get addresses for interface %s: %v", iface.Name, err)
-				continue
-			}
-
-			for _, addr := range addrs {
-				var ip net.IP
-				switch v := addr.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-				// IPv4 주소만 반환
-				if ip != nil && ip.To4() != nil {
-					w.address = ip.String()
-					return w.address
-				}
-			}
-		}
-	}
-
-	w.wlog.Println("No suitable network interface found")
-	return ""
+	return c
 }
 
-func (w *CONSENSUSNODE) start() {
-	go w.setLeaderChan(false, "")
-	go w.setDone(false)
-	w.leader = false
-
-	// [GossipSub: Tx Proposal Listening]
-	// 1. All w-nodes receive every round of Gossip round messages from s-nodes (committee)
-	// 2. If leader, run block listening
-	// 3. Two message types: type-1 round msg, type-2 block msg (consensus)
-
-	go w.CommitteeListening()
-	go w.BlockListening()
-	go w.ConsensusListening()
-
-	// [GRPC: Membership Message]
-	// 1. Report network info
-	// 2. Get WDN Members info
-	w.Reporting()
-
-	// To solve AWS NAT Problem (외부 IP 주소를 알려주기 위해)
-	time.Sleep(3 * time.Second)
-	ReportExternal(w.selfId)
-
-	for {
-		time.Sleep(10 * time.Second)
-		w.Reporting()
-	}
-}
-
-func idxToInt(s string) int {
-	var num int
-	fmt.Sscanf(s, "%d", &num)
-	return num
-}
-
-// kafkaListener pulls reliable blocks from the Weave Kafka partition when
-// the peer is a leader.
-
-func (w *CONSENSUSNODE) KafkaListener(rekey string) {
+func (w *CONSENSUSNODE) InitKafka() error {
 	c := NewKafkaConsumer()
-	defer c.Close()
-	err := c.SubscribeTopics([]string{rekey}, nil)
+	err := c.SubscribeTopics([]string{"mychannel-abort"}, nil)
 	if err != nil {
-		log.Printf("Failed to subscribe to topic %s: %v", rekey, err)
-		return
+		return err
 	}
-
-	re := regexp.MustCompile(`User(\d+)`)
-
-	for {
-		select {
-		case done := <-w.done:
-			fmt.Println(done, "❌", w.isLeader.Load())
-			if done && !w.isLeader.Load() {
-				c.Close()
-				return
-			}
-		default:
-			msg, err := c.ReadMessage(-1)
-			if err != nil {
-				log.Printf("Kafka read error: %v", err)
-				continue
-			}
-
-			var Abortdata []*common.Envelope
-			err = json.Unmarshal(msg.Value, &Abortdata)
-			if err != nil {
-				log.Printf("Failed to unmarshal Kafka message: %v", err)
-				continue
-			}
-
-			userIDs := []int{}
-			for _, env := range Abortdata {
-				payload, err := protoutil.UnmarshalTransaction(env.Payload)
-				if err != nil {
-					log.Printf("Failed to unmarshal transaction payload: %v", err)
-					continue
-				}
-
-				match := re.FindStringSubmatch(payload.String())
-				if len(match) > 1 {
-					idx := idxToInt(match[1])
-					userIDs = append(userIDs, idx)
-				}
-			}
-
-			userCount := make(map[string]int)
-			for _, id := range userIDs {
-				userKey := "User" + strconv.Itoa(id)
-				userCount[userKey]++
-			}
-
-			fmt.Println("User Count Map:", userCount)
-
-			w.auditMsg = &pb.AuditMsg{}
-			go w.bftConsensus(userCount)
-
-		}
-	}
-}
-
-func (w *CONSENSUSNODE) bftConsensus(userCount map[string]int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Construct initial consensus message
-	w.auditMsg = &pb.AuditMsg{
-		BlkNum:              w.roundIdx,
-		LeaderID:            w.selfId,
-		PhaseNum:            pb.AuditMsg_PREPARE,
-		MerkleRootHash:      "abcdefghijklmnopqrstuvwxyz",
-		AbortTransactionNum: userCount,
-		HonestAuditors:      []string{w.selfId},
-	}
-
-	// Hashing
-	if w.auditMsg.BlkNum == 1 {
-		w.auditMsg.CurHash = "ajknadajsnamajkndqwaakdmkaiwq"
-	} else {
-		hashBytes := lg.BlockHashCalculator(w.auditMsg)
-		hash := sha512.Sum512(hashBytes)
-		w.auditMsg.CurHash = hex.EncodeToString(hash[:63])
-	}
-
-	// Signature
-	signing := sec.SignByte([]byte(w.auditMsg.CurHash))
-	w.auditMsg.Signature = signing.Serialize()
-
-	// === 1st Phase: PREPARE ===
-	fmt.Println("🚀 Broadcasting PREPARE")
-	chPrepare := make(chan bool, len(w.members))
-	for _, each := range w.members {
-		go w.SubmitPrepare(chPrepare, each.Addr)
-	}
-
-	if waitForVotes(chPrepare, len(w.members)) {
-		fmt.Println("✅ PREPARE Quorum achieved")
-	} else {
-		fmt.Println("⚠️ PREPARE Quorum not achieved")
-	}
-	<-ctx.Done()
-
-	// === 2nd Phase: COMMIT ===
-	fmt.Println("🚀 Broadcasting COMMIT")
-	chCommit := make(chan bool, len(w.members))
-	for _, each := range w.members {
-		go w.SubmitCommit(chCommit, each.Addr)
-	}
-
-	if waitForVotes(chCommit, len(w.members)) {
-		fmt.Println("✅ COMMIT Quorum achieved")
-	} else {
-		fmt.Println("⚠️ COMMIT Quorum not achieved")
-	}
-	<-ctx.Done()
-
-	// === Final: Disseminate block ===
-	fmt.Println("📦 Disseminating block to peers")
-	gossipMsg := &pb.GossipMsg{
-		Type:   2,
-		Rndblk: w.auditMsg,
-	}
-	wp2p.WDNMessage(wp2p.Wctx, wp2p.Shard[0], gossipMsg)
-}
-
-func waitForVotes(ch chan bool, total int) bool {
-	votes := 0
-	quorum := 1 // TODO: replace with 2f+1 logic if needed
-
-	for {
-		select {
-		case <-ch:
-			votes++
-			fmt.Printf("🗳️ Votes: %d/%d\n", votes, total)
-			if votes >= quorum {
-				return true
-			}
-		default:
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+	w.kafkaConsumer = c
+	return nil
 }
 
 func (w *CONSENSUSNODE) setLeaderChan(isLeader bool, channel string) {
@@ -451,79 +162,32 @@ func (w *CONSENSUSNODE) setDone(b bool) {
 	w.done <- b
 }
 
-// Check if this peer is the leader; if so, it should receive messages from Kafka.
-// BlockListening listens for consensus-related block messages.
-func (w *CONSENSUSNODE) BlockListening() {
-	w.GetAddress()
-	listener, err := net.Listen("tcp", w.address+consensusPort)
-	if err != nil {
-		log.Fatalf("❌ Failed to listen on %s: %v", w.address+consensusPort, err)
-	}
-	defer listener.Close()
+// ======================= Node Methods =======================
+func (w *CONSENSUSNODE) start(consensusProtocol bool) {
+	go w.setLeaderChan(false, "")
+	go w.setDone(false)
+	w.leader = false
 
-	fmt.Println("📡 BlockListenIP:", w.address+consensusPort)
+	// [GossipSub: Tx Proposal Listening]
+	go w.InitKafka()
+	go w.CommitteeListening()
+	go w.BlockListening()
+	go w.ConsensusListening()
+	w.isRunning.Store(false)
+	// go w.MP2BTPConsensusListening(pu) // 주석 처리: 필요 시 사용
+
+	// [GRPC: Membership Message]
+	w.Reporting()
+	time.Sleep(3 * time.Second)
+	ReportExternal(w.selfId)
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Println("⚠️ Accept error:", err)
-			continue
-		}
-		go w.BloConnHandler(conn)
+		time.Sleep(10 * time.Second)
+		w.Reporting()
 	}
 }
 
-// BloConnHandler handles incoming consensus messages (leader/follower/block insertion).
-func (w *CONSENSUSNODE) BloConnHandler(conn net.Conn) {
-	defer conn.Close()
-
-	recvBuf := make([]byte, 8192)
-	n, err := conn.Read(recvBuf)
-	if err != nil {
-		if err == io.EOF {
-			log.Printf("🔌 Connection closed by client: %v", conn.RemoteAddr())
-		} else {
-			log.Printf("❌ Failed to read data: %v", err)
-		}
-		return
-	}
-
-	MsgRecv := &pb.GossipMsg{}
-	if err := json.Unmarshal(recvBuf[:n], MsgRecv); err != nil {
-		log.Printf("❌ Failed to unmarshal GossipMsg: %v", err)
-		return
-	}
-
-	fmt.Println("🏦 Received GossipMsg:", MsgRecv)
-
-	switch MsgRecv.GetType() {
-	case 1:
-		w.roundIdx = MsgRecv.RndMsg.RoundNum
-		isLeader := (MsgRecv.RndMsg.LeaderID == w.selfId)
-
-		w.leader = isLeader
-		w.channelID = MsgRecv.Channel
-
-		if isLeader {
-			fmt.Println("👑 Elected as leader")
-			go w.setDone(false)
-			go w.isLeader.Store(true)
-			go w.KafkaListener(w.channelID + "-abort")
-			fmt.Println(w.isLeader.Load())
-		} else {
-			fmt.Println("🧩 Follower consensus node")
-			go w.setDone(true)
-			go w.isLeader.Store(false)
-			fmt.Println(w.isLeader.Load())
-		}
-
-	case 2:
-		fmt.Println("📦 BLOCKINSERT: Committing block to ledger")
-		go lg.UserAbortInfoInsert(w.auditMsg)
-	}
-}
-
-// decide whether the peer is elected as a leader or not
+// ======================= Committee Listening =======================
 func (w *CONSENSUSNODE) CommitteeListening() {
 	w.GetAddress()
 	listener, err := net.Listen("tcp", w.address+gossipListenPort)
@@ -531,8 +195,6 @@ func (w *CONSENSUSNODE) CommitteeListening() {
 		log.Fatalf("Failed to listen on %s: %v", w.address+gossipListenPort, err)
 	}
 	defer listener.Close()
-
-	fmt.Println("📡 CommitteeListenIP:", w.address+gossipListenPort)
 
 	for {
 		conn, err := listener.Accept()
@@ -564,134 +226,284 @@ func (w *CONSENSUSNODE) CommConnHandler(conn net.Conn) {
 		return
 	}
 
-	w.roundIdx = recvMsg.RoundNum
+	// ======================= 합의 중 처리 =======================
+	if w.isRunning.Load() {
+		w.pendingCommittee = recvMsg
+		log.Printf("⚠️ Still processing previous consensus round, storing new CommitteeMsg (round %d) as pending", recvMsg.RoundNum)
+		return
+	}
 
-	for _, shard := range recvMsg.Shards {
-		for _, mem := range shard.Member {
-			if mem.NodeID == w.selfId {
-				w.members = shard.Member
+	w.applyCommittee(recvMsg)
+}
 
-				isLeader := (recvMsg.GetType() == 1 && shard.LeaderID == w.selfId)
+// // Check if this peer is the leader; if so, it should receive messages from Kafka.
+// // BlockListening listens for block insertion.
+func (w *CONSENSUSNODE) BlockListening() {
+	w.GetAddress()
+	listener, err := net.Listen("tcp", w.address+grpcPort)
+	if err != nil {
+		log.Fatalf("❌ Failed to listen on %s: %v", w.address+grpcPort, err)
+	}
+	defer listener.Close()
 
-				w.leader = isLeader
-				w.channelID = leaderChan // use fixed ID if that is intended
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("⚠️ Accept error:", err)
+			continue
+		}
+		go w.BloConnHandler(conn)
+	}
+}
 
-				if isLeader {
-					fmt.Println("👑 Elected as leader")
-					go w.setDone(false)
-					go w.isLeader.Store(true)
-					go w.KafkaListener(w.channelID + "-abort")
-					fmt.Println(w.isLeader.Load())
-				} else {
-					fmt.Println("🧩 Follower consensus node")
-					go w.setDone(true)
-					go w.isLeader.Store(false)
-					fmt.Println(w.isLeader.Load())
+func (w *CONSENSUSNODE) BloConnHandler(conn net.Conn) {
+	defer conn.Close()
+
+	recvBuf := make([]byte, 8192)
+	n, err := conn.Read(recvBuf)
+	if err != nil {
+		if err == io.EOF {
+			log.Printf("🔌 Connection closed by client: %v", conn.RemoteAddr())
+		} else {
+			log.Printf("❌ Failed to read data: %v", err)
+		}
+		return
+	}
+
+	MsgRecv := &pb.GossipMsg{}
+	if err := json.Unmarshal(recvBuf[:n], MsgRecv); err != nil {
+		log.Printf("❌ Failed to unmarshal GossipMsg: %v", err)
+		return
+	}
+
+	fmt.Println("📦 BLOCKINSERT: Committing block to ledger")
+	go lg.UserAbortInfoInsert(MsgRecv.Rndblk)
+
+	if w.pendingCommittee != nil {
+		w.applyCommittee(w.pendingCommittee)
+		w.pendingCommittee = nil
+	}
+}
+
+func (w *CONSENSUSNODE) StartListener(topic string) {
+	if w.isRunning.Load() {
+		fmt.Println("이미 실행 중")
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.cancel = cancel
+	w.isRunning.Store(true)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("💥 KafkaListener panic 발생: %v\n", r)
+				debug.PrintStack()
+			}
+		}()
+		defer w.isRunning.Store(false)
+
+		w.KafkaListener(ctx, topic) // <- context 받아서 내부 loop 제어
+	}()
+}
+
+func (w *CONSENSUSNODE) StopListener() {
+	if w.cancel != nil {
+		w.cancel()
+		fmt.Println("Listener 중단 요청")
+	}
+}
+
+// ======================= Pending Committee 적용 =======================
+func (w *CONSENSUSNODE) applyCommittee(msg *pb.CommitteeMsg) {
+	w.done = make(chan bool, 1)
+	w.roundIdx = msg.RoundNum
+
+	for _, shard := range msg.Shards {
+		if len(shard.Member) != 1 {
+			for _, mem := range shard.Member {
+				if mem.NodeID == w.selfId {
+
+					fmt.Println(msg.RoundNum)
+
+					// if !verifyVRF(mem.VRFProof, mem.PublicKey, msg.RoundNum) {
+					// 	fmt.Println("❌ VRF 검증 실패, 메시지 무시")
+					// 	return
+					// }
+
+					w.members = shard.Member
+
+					isLeader := (msg.GetType() == 1 && shard.LeaderID == w.selfId)
+					w.leader = isLeader
+					w.channelID = leaderChan
+
+					if isLeader {
+						fmt.Println("🎉Leader consensus node")
+						go func() {
+							defer func() {
+								if r := recover(); r != nil {
+									fmt.Printf("💥 KafkaListener 내부 goroutine에서 panic 발생: %v\n", r)
+									debug.PrintStack()
+								}
+							}()
+							defer w.setDone(false)
+							defer w.isRunning.Store(false)
+							w.StartListener(w.channelID + "-abort")
+						}()
+					} else {
+						fmt.Println("🧩 Follower consensus node")
+						w.StopListener()
+					}
+					return
 				}
-
-				return // exit after setting role
-
-				// push := w.MP2BTPChildOnce()
-				// w.MP2BTPConsensusListening(push)
 			}
 		}
 	}
 }
 
+// ======================= Kafka Listener =======================
+func (w *CONSENSUSNODE) KafkaListener(ctx context.Context, rekey string) {
+	re := regexp.MustCompile(`User(\d+)`)
+	for {
+		msg, err := w.kafkaConsumer.ReadMessage(-1)
+		if err != nil {
+			log.Printf("Kafka read error: %v", err)
+			continue
+		}
+		_, err = w.kafkaConsumer.CommitMessage(msg)
+		if err != nil {
+			log.Printf("Failed to commit message: %v", err)
+		}
+
+		var Abortdata []*pb.TransactionMsg
+		err = json.Unmarshal(msg.Value, &Abortdata)
+		if err != nil {
+			log.Printf("Failed to unmarshal Kafka message: %v", err)
+			continue
+		}
+
+		userCount := make(map[string]int32)
+		for _, data := range Abortdata {
+			match := re.FindStringSubmatch(data.String())
+			if len(match) > 1 {
+				idx := idxToInt(match[1])
+				userKey := "User" + strconv.Itoa(idx)
+				userCount[userKey]++
+			}
+		}
+
+		w.auditMsg = &pb.AuditMsg{}
+		w.bftConsensus(userCount)
+
+	}
+}
+
+func (w *CONSENSUSNODE) bftConsensus(userCount map[string]int32) {
+	setConsensusStart(w.selfId)
+	defer cancel()
+
+	w.auditMsg = &pb.AuditMsg{
+		BlkNum:              w.roundIdx,
+		LeaderID:            w.selfId,
+		PhaseNum:            pb.AuditMsg_PREPARE,
+		MerkleRootHash:      "abcdefghijklmnopqrstuvwxyz",
+		Aborttransactionnum: userCount,
+		HonestAuditors: []*pb.HonestAuditor{
+			{Id: w.selfId},
+		},
+	}
+
+	hashBytes := lg.BlockHashCalculator(w.auditMsg)
+	hash := sha512.Sum512(hashBytes)
+	w.auditMsg.CurHash = hex.EncodeToString(hash[:63])
+
+	signing := sec.SignByte([]byte(w.auditMsg.CurHash))
+	w.auditMsg.Signature = signing.Serialize()
+
+	// ==== PREPARE & COMMIT Broadcasting ====
+	fmt.Println("🚀 Broadcasting PREPARE")
+	chPrepare := make(chan *pb.AuditMsg, len(w.members))
+	for _, each := range w.members {
+		go w.Submit(chPrepare, each.Addr, pb.AuditMsg_AGGREGATED_PREPARE)
+	}
+	quorum := len(w.members) // TODO: 2f+1 로 계산
+	w.waitForVotes(chPrepare, quorum, pb.AuditMsg_AGGREGATED_PREPARE)
+
+	fmt.Println("🚀 Broadcasting COMMIT")
+	chCommit := make(chan *pb.AuditMsg, len(w.members))
+	for _, each := range w.members {
+		go w.Submit(chCommit, each.Addr, pb.AuditMsg_AGGREGATED_COMMIT)
+	}
+	w.waitForVotes(chCommit, quorum, pb.AuditMsg_AGGREGATED_COMMIT)
+
+	fmt.Println("📦 Disseminating block to peers")
+	gossipMsg := &pb.GossipMsg{
+		Type:   2,
+		Rndblk: w.auditMsg,
+	}
+	wp2p.WDNMessage(wp2p.Wctx, wp2p.Shard[0], gossipMsg)
+	setConsensusDone(w.selfId)
+}
+
 /*I'm a leader, send a message to a w-node*/
-func (w *CONSENSUSNODE) SubmitPrepare(ch chan<- bool, ip string) {
-	w.submitPhase(ch, ip, pb.AuditMsg_AGGREGATED_PREPARE)
-}
-
-func (w *CONSENSUSNODE) SubmitCommit(ch chan<- bool, ip string) {
-	w.submitPhase(ch, ip, pb.AuditMsg_AGGREGATED_COMMIT)
-}
-
-func (w *CONSENSUSNODE) submitPhase(ch chan<- bool, ip string, targetPhase pb.AuditMsg_Phases) {
+func (w *CONSENSUSNODE) Submit(ch chan<- *pb.AuditMsg, ip string, targetPhase pb.AuditMsg_Phases) {
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quic-echo-example"},
 	}
 	session, err := quic.DialAddr(context.Background(), ip+gossipMsgPort, tlsConf, nil)
 	if err != nil {
-		log.Printf("❌ Failed to connect to %s: %v", ip, err)
-		ch <- false
+		log.Printf("❌ Failed to connect to %s: %v", ip+gossipMsgPort, err)
+		ch <- nil
 		return
 	}
+
 	defer session.CloseWithError(0, "")
 
 	stream, err := session.OpenStreamSync(context.Background())
 	if err != nil {
 		log.Printf("❌ Failed to open stream: %v", err)
-		ch <- false
+		ch <- nil
 		return
 	}
 
 	sndBuf, err := json.Marshal(w.auditMsg)
 	if err != nil {
 		log.Printf("❌ Marshal error: %v", err)
-		ch <- false
+		ch <- nil
 		return
 	}
 	_, err = stream.Write(sndBuf)
 	if err != nil {
 		log.Printf("❌ Write error: %v", err)
-		ch <- false
+		ch <- nil
 		return
 	}
 
-	remoteIP := session.RemoteAddr().String()
-	fmt.Println("연결된 상대 IP:", remoteIP)
-
-	for {
-		rcvBuf := make([]byte, 8192)
-		n, err := stream.Read(rcvBuf)
-		if err != nil {
-			// log.Printf("❌ Stream read error: %v", err)
-			ch <- false
-			break
-		}
-		if n == 0 {
-			continue
-		}
-
-		cMsgRecv := &pb.AuditMsg{}
-		if err := json.Unmarshal(rcvBuf[:n], cMsgRecv); err != nil {
-			log.Println("❌ JSON unmarshal error:", err)
-			continue
-		}
-
-		if cMsgRecv.PhaseNum != targetPhase {
-			continue
-		}
-
-		sig := bls.Sign{}
-		if err := sig.Deserialize(cMsgRecv.Signature); err != nil {
-			log.Println("❌ Signature deserialize error:", err)
-			continue
-		}
-		sigVec = append(sigVec, sig)
-		if len(sigVec) == len(w.memberMsg.Nodes) {
-			log.Printf("✅ Phase %v Aggregation Complete", targetPhase)
-			w.Multisinging(cMsgRecv, sigVec)
-			sigVec = sigVec[:0]
-			if targetPhase == pb.AuditMsg_AGGREGATED_PREPARE {
-				w.auditMsg.HonestAuditors = cMsgRecv.HonestAuditors
-			}
-			break
-		} else {
-			log.Printf("⏳ Waiting for more signatures: %d/%d", len(sigVec), len(w.memberMsg.Nodes))
-			continue
-		}
+	rcvBuf := make([]byte, 8192)
+	n, err := stream.Read(rcvBuf)
+	if err != nil || n == 0 {
+		ch <- nil
+		return
 	}
 
-	stream.Close()
-	ch <- true
+	msg := &pb.AuditMsg{}
+	if err := json.Unmarshal(rcvBuf[:n], msg); err != nil {
+		log.Println("❌ JSON unmarshal error:", err)
+		ch <- nil
+		return
+	}
+
+	if msg.PhaseNum == targetPhase {
+		ch <- msg
+	} else {
+		ch <- nil
+	}
 }
 
 /*Consensus three-phases: Announce(Completed State), Prepare, Commit] I'm not a leader*/
 func (w *CONSENSUSNODE) ConsensusListening() {
-
 	w.GetAddress()
 	listener, err := quic.ListenAddr(w.address+gossipMsgPort, generateTLSConfig(), nil)
 	if err != nil {
@@ -715,8 +527,8 @@ func (w *CONSENSUSNODE) StreamHandler(stream quic.Stream) {
 	for {
 		rcvBuf := make([]byte, 8192)
 		n, err := stream.Read(rcvBuf)
+
 		if err != nil {
-			// log.Printf("❌ Stream read error: %v", err)
 			break
 		}
 
@@ -749,6 +561,7 @@ func (w *CONSENSUSNODE) StreamHandler(stream quic.Stream) {
 }
 
 func (w *CONSENSUSNODE) preparePhase(cMsg *pb.AuditMsg) {
+	w.auditMsg = cMsg
 	hash := []byte(cMsg.CurHash)
 	signing := sec.SignByte(hash)
 	w.auditMsg.Signature = signing.Serialize()
@@ -757,11 +570,28 @@ func (w *CONSENSUSNODE) preparePhase(cMsg *pb.AuditMsg) {
 }
 
 func (w *CONSENSUSNODE) commitPhase(cMsg *pb.AuditMsg) {
+	w.auditMsg = cMsg
 	hash := []byte(cMsg.CurHash)
 	signing := sec.SignByte(hash)
 	w.auditMsg.Signature = signing.Serialize()
 	w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_COMMIT
 	w.updateAuditFields(cMsg)
+}
+
+func (w *CONSENSUSNODE) updateAuditFields(cMsg *pb.AuditMsg) {
+
+	alreadyExists := false
+	for _, id := range cMsg.HonestAuditors {
+		if id.Id == w.selfId {
+			alreadyExists = true
+			break
+		}
+	}
+	if !alreadyExists {
+		w.auditMsg.HonestAuditors = append(cMsg.HonestAuditors, &pb.HonestAuditor{Id: w.selfId})
+	} else {
+		w.auditMsg.HonestAuditors = cMsg.HonestAuditors
+	}
 }
 
 func (w *CONSENSUSNODE) sendResponse(stream quic.Stream) {
@@ -774,67 +604,6 @@ func (w *CONSENSUSNODE) sendResponse(stream quic.Stream) {
 	}
 }
 
-func (w *CONSENSUSNODE) updateAuditFields(cMsg *pb.AuditMsg) {
-	w.auditMsg.CurHash = cMsg.CurHash
-	w.auditMsg.MerkleRootHash = cMsg.MerkleRootHash
-
-	alreadyExists := false
-	for _, id := range cMsg.HonestAuditors {
-		if id == w.selfId {
-			alreadyExists = true
-			break
-		}
-	}
-	if !alreadyExists {
-		w.auditMsg.HonestAuditors = append(cMsg.HonestAuditors, w.selfId)
-	} else {
-		w.auditMsg.HonestAuditors = cMsg.HonestAuditors
-	}
-}
-
-func (w *CONSENSUSNODE) verifying(cMsg *pb.AuditMsg) bool {
-	pubVec = pubVec[:0]
-
-	for _, honestID := range cMsg.HonestAuditors {
-		if pk := w.getPublicKeyByNodeID(honestID); pk != nil {
-			pubVec = append(pubVec, *pk)
-		} else {
-			fmt.Printf("Missing public key for node: %s\n", honestID)
-		}
-	}
-
-	fmt.Printf("👑 Phase: %v\n👑 Public Keys Count: %d\n👑 Public Keys: %v\n", cMsg.PhaseNum, len(pubVec), pubVec)
-
-	var decSign bls.Sign
-	if err := decSign.Deserialize(cMsg.Signature); err != nil {
-		fmt.Println("Signature deserialization error:", err)
-		return false
-	}
-
-	switch cMsg.PhaseNum {
-	case pb.AuditMsg_COMMIT:
-		if decSign.FastAggregateVerify(pubVec, []byte(cMsg.CurHash)) {
-			fmt.Println("✅ AGGREGATED_COMMIT: Verification SUCCESS")
-			return true
-		}
-		fmt.Println("❌ AGGREGATED_COMMIT: Verification ERROR")
-	}
-	return false
-}
-
-func (w *CONSENSUSNODE) getPublicKeyByNodeID(id string) *bls.PublicKey {
-	for _, node := range w.memberMsg.Nodes {
-		if node.NodeID == id {
-			dec := &bls.PublicKey{}
-			if err := dec.Deserialize(node.Publickey); err != nil {
-				fmt.Printf("Failed to deserialize public key for node %s: %v\n", id, err)
-				return nil
-			}
-			return dec
-		}
-	}
-	return nil
-}
 func (w *CONSENSUSNODE) Multisinging(cMsgs *pb.AuditMsg, sigVec []bls.Sign) (bool, int) {
 	switch cMsgs.PhaseNum {
 	case pb.AuditMsg_AGGREGATED_PREPARE:
@@ -869,6 +638,103 @@ func (w *CONSENSUSNODE) aggregateAndSet(cMsgs *pb.AuditMsg, sigVec []bls.Sign, p
 	return true
 }
 
+func (w *CONSENSUSNODE) verifying(cMsg *pb.AuditMsg) bool {
+	pubVec = pubVec[:0]
+
+	for _, honestID := range cMsg.HonestAuditors {
+		if pk := w.getPublicKeyByNodeID(honestID.Id); pk != nil {
+			pubVec = append(pubVec, *pk)
+		} else {
+			fmt.Println("Missing public key for node: %s\n", honestID)
+		}
+	}
+
+	var decSign bls.Sign
+	if err := decSign.Deserialize(cMsg.Signature); err != nil {
+		fmt.Println("Signature deserialization error:", err)
+		return false
+	}
+
+	switch cMsg.PhaseNum {
+	case pb.AuditMsg_COMMIT:
+		if decSign.FastAggregateVerify(pubVec, []byte(cMsg.CurHash)) {
+			fmt.Println("✅ AGGREGATED_COMMIT: Verification SUCCESS")
+			return true
+		}
+		fmt.Println("❌ AGGREGATED_COMMIT: Verification ERROR")
+	}
+	return false
+}
+
+func (w *CONSENSUSNODE) getPublicKeyByNodeID(id string) *bls.PublicKey {
+	for _, node := range w.memberMsg.Nodes {
+		if node.NodeID == id {
+			dec := &bls.PublicKey{}
+			if err := dec.Deserialize(node.Publickey); err != nil {
+				fmt.Printf("Failed to deserialize public key for node %s: %v\n", id, err)
+				return nil
+			}
+			return dec
+		}
+	}
+	return nil
+}
+
+// ======================= Helper =======================
+
+func (w *CONSENSUSNODE) GetAddress() string {
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		// loopback 제외
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil {
+				w.address = ip.String()
+				return w.address
+			}
+		}
+	}
+	return ""
+}
+
+type VRFNode struct {
+	NodeID string
+	PubKey *bls.PublicKey
+	Seed   string
+	Proof  []byte
+	Value  *big.Int
+}
+
+func GenerateVRF(nodeID string, seed string) (node *VRFNode) {
+
+	nodeinit := &VRFNode{
+		NodeID: nodeID,
+		PubKey: pub,
+	}
+
+	hash := sha256.Sum256([]byte(seed))
+	sign := sec.SignByte(hash[:]) // 기존 sec 사용
+	nodeinit.Proof = sign.Serialize()
+
+	vrfHash := sha256.Sum256(sign.Serialize())
+	nodeinit.Value = new(big.Int).SetBytes(vrfHash[:])
+
+	return nodeinit
+}
+
 /*GRPC SERVICE Membershhip Exchanging Procedure*/
 func (w *CONSENSUSNODE) Reporting() {
 	conn, err := grpc.Dial(validatorGrpcAddr, grpc.WithInsecure(), grpc.WithBlock())
@@ -878,7 +744,8 @@ func (w *CONSENSUSNODE) Reporting() {
 	defer conn.Close()
 
 	c := pb.NewMembershipServiceClient(conn)
-	req := createSelfMembership(w.selfId, pub.Serialize(), "11730")
+	nodeinfo := GenerateVRF(w.address, "hello")
+	req := createSelfMembership(w.selfId, w.address, pub.Serialize(), "11730", nodeinfo)
 
 	w.memberMsg, err = c.GetMembership(context.Background(), req)
 	if err != nil {
@@ -886,13 +753,19 @@ func (w *CONSENSUSNODE) Reporting() {
 	}
 }
 
-func createSelfMembership(id string, pubKey []byte, port string) *pb.MemberMsg {
+func createSelfMembership(id string, addr string, pubKey []byte, port string, nodeinfo *VRFNode) *pb.MemberMsg {
+	value, _ := json.Marshal(nodeinfo.Value.Bytes())
+
 	node := &pb.Node{
 		NodeID:    id,
+		Addr:      addr,
 		Port:      port,
 		Publickey: pubKey,
-		Alive:     true,
+		Seed:      "hello",
+		Proof:     nodeinfo.Proof,
+		Value:     value,
 	}
+
 	return &pb.MemberMsg{Nodes: []*pb.Node{node}}
 }
 
@@ -945,367 +818,79 @@ func generateTLSConfig() *tls.Config {
 	}
 }
 
-// MP2BTP + WDN
-
-// -------------------------------------------------------------------------------------- //
-var mu sync.Mutex
-
-func (w *CONSENSUSNODE) MP2BTPRootOnce(ch chan<- bool, addrs []string) *PuCtrl.PuCtrl {
-	mu.Lock()
-	defer mu.Unlock()
-	w.GetAddress()
-
-	peerId := rd.Intn(10) + 1
-
-	configFile := "./push_root.toml"
-	fmt.Println("MP2BTPSubmit IP:", addrs)
-
-	err := WriteTomlFile(configFile, w.address, addrs)
-	if err != nil {
-		fmt.Println("❌ TOML 파일 생성 실패:", err)
-		ch <- false
-		return nil
-	}
-
-	fmt.Println("✅ TOML 파일 생성 완료:", configFile)
-
-	var config PuCtrl.Config
-	if _, err := toml.DecodeFile(configFile, &config); err != nil {
-		panic(err)
-	}
-
-	pu := PuCtrl.CreatePuCtrl(configFile, uint32(peerId))
-
-	fmt.Println("🖥️", config.PEER_ADDRS, "🖥️")
-
-	nodeInfo := pu.GetNodeInfo(config.PEER_ADDRS)
-
-	pu.Listen()
-
-	time.Sleep(1 * time.Second)
-
-	pu.Connect(nodeInfo, byte(PuCtrl.PUSH_SESSION))
-
-	time.Sleep(1 * time.Second)
-	return pu
-}
-func (w *CONSENSUSNODE) MP2BTPSubmit(ch chan<- bool, pu *PuCtrl.PuCtrl) {
-
-	sndBuf, err := json.Marshal(w.auditMsg)
-	if err != nil {
-		fmt.Println("❌ JSON 직렬화 실패:", err)
-		ch <- false
-		return
-	}
-	pu.SendAuditMsg(sndBuf)
-	fmt.Println("💛FINISH", sndBuf, "💛FINISH")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	resultCh := make(chan recvResult)
-	go receiveWorker(pu, resultCh)
-
-	for {
-		select {
-		case result := <-resultCh:
-			if result.err != nil {
-				fmt.Println("❌ Error:", result.err)
-				ch <- false
-				return
-			}
-			if result.buf == nil || len(result.buf) == 0 {
-				continue
-			}
-			datalength := int(result.buf[0])
-			if datalength > len(result.buf)-1 {
-				fmt.Println("⚠️ 데이터 길이 이상:", datalength)
-				ch <- false
-				return
-			}
-			resultData := make([]byte, datalength)
-			copy(resultData, result.buf[1:datalength+1])
-
-			fmt.Printf("📦 수신 (%d bytes): %v\n", datalength, resultData)
-			ch <- true
-			break
-
-		case <-ctx.Done():
-			fmt.Println("🛑 수신 시간 초과 또는 취소")
-			ch <- false
-			return
-		}
-		break
-	}
-
+func idxToInt(s string) int {
+	var num int
+	fmt.Sscanf(s, "%d", &num)
+	return num
 }
 
-type recvResult struct {
-	n   int
-	err error
-	buf []byte
+func setConsensusStart(id string) {
+	consensusStatusMap[id] = false
 }
 
-func receiveWorker(pu *PuCtrl.PuCtrl, resultCh chan<- recvResult) {
-	for {
-		buf := make([]byte, 8192)
-		buf, err := pu.ReceiveRaw(buf)
-		if err != nil {
-			resultCh <- recvResult{buf: nil, err: err}
-			return
-		}
-		resultCh <- recvResult{buf: buf, err: nil}
-	}
-}
-func (w *CONSENSUSNODE) MP2BTPChildOnce() *PuCtrl.PuCtrl {
-	fmt.Println("😬 Starting Consensus Child")
-
-	configFile := "./push_child.toml"
-	peerId := rd.Intn(10) + 1
-
-	if _, err := toml.DecodeFile(configFile, new(PuCtrl.Config)); err != nil {
-		fmt.Println("❌ Config 파일 파싱 실패:", err)
-		return nil
-	}
-
-	pu := PuCtrl.CreatePuCtrl(configFile, uint32(peerId))
-
-	time.Sleep(1 * time.Second)
-
-	pu.Listen()
-
-	time.Sleep(1 * time.Second)
-	return pu
+func setConsensusDone(id string) {
+	consensusStatusMap[id] = true
 }
 
-func (w *CONSENSUSNODE) MP2BTPConsensusListening(pu *PuCtrl.PuCtrl) {
-
-	s, _ := os.Create(fmt.Sprintf("log.txt"))
-	defer s.Close()
-
-	startTime := time.Now()
-	recvBytes := 0
-	datalength := 0
-	resultData := make([]byte, datalength)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	resultCh := make(chan recvResult)
-	go receiveWorker(pu, resultCh)
-
-	for {
-		select {
-		case result := <-resultCh:
-			if result.err != nil {
-				fmt.Println("❌ Error:", result.err)
-				return
-			}
-			if result.buf == nil || len(result.buf) == 0 {
-				continue
-			}
-			fmt.Println("⭐️")
-			datalength = int(result.buf[0])
-			if datalength > len(result.buf)-1 {
-				fmt.Println("⚠️ 데이터 길이 이상:", datalength)
-				return
-			}
-
-			copy(resultData, result.buf[1:datalength+1])
-			fmt.Printf("📦 수신 (%d bytes): %v\n", datalength, resultData)
-			break
-
-		case <-ctx.Done():
-			fmt.Println("🛑 수신 시간 초과 또는 취소")
-			return
-		}
-		break
-	}
-
-	elapsedTime := time.Since(startTime)
-	throughput := (float64(recvBytes) * 8.0) / elapsedTime.Seconds() / (1000 * 1000)
-	logStr := fmt.Sprintf("Seconds=%f, Throughput=%f, ReceivedSize=%d\n", elapsedTime.Seconds(), throughput, recvBytes)
-	s.Write([]byte(logStr))
-
-	var auditMsg pb.AuditMsg
-	fmt.Println(datalength, resultData[1:datalength+1])
-	if err := json.Unmarshal(resultData[1:datalength+1], &auditMsg); err != nil {
-		fmt.Println("Unmarshal error:", err)
-	}
-
-	if auditMsg.PhaseNum == pb.AuditMsg_PREPARE {
-		hash := []byte(auditMsg.PrevHash)
-		signing := sec.SignByte(hash)
-		byteSig := signing.Serialize()
-		w.auditMsg.Signature = byteSig
-		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_PREPARE
-	}
-
-	if auditMsg.PhaseNum == pb.AuditMsg_COMMIT {
-		hash := []byte(auditMsg.PrevHash)
-		signing := sec.SignByte(hash)
-		byteSig := signing.Serialize()
-		w.auditMsg.Signature = byteSig
-		w.auditMsg.PhaseNum = pb.AuditMsg_AGGREGATED_COMMIT
-	}
-
-	sndBuf, err := json.Marshal(w.auditMsg)
-	if err != nil {
-		panic(err)
-	}
-	err = pu.SendAuditMsg(sndBuf)
-	if err != nil {
-		panic(err)
-	}
-}
-
-// -------------------------------------------------------------------------------------- //
-
-func WriteTomlFile(fileName string, myIP string, addrs []string) error {
-	_ = os.Remove(fileName)
-	f, err := os.Create(fileName)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	fixedConfig := fmt.Sprintf(`# MP2BTP Configurations
-VERBOSE_MODE        = true
-NUM_MULTIPATH       = 1
-MY_IP_ADDRS         = ["%s", "127.0.0.1"]
-LISTEN_PORT         = 4000
-BIND_PORT           = 5000
-EQUIC_ENABLE        = true
-EQUIC_PATH          = "./fectun"
-EQUIC_APP_SRC_PORT  = 6000
-EQUIC_APP_DST_PORT  = 5000
-EQUIC_TUN_SRC_PORT  = 7000
-EQUIC_TUN_DST_PORT  = 7000
-EQUIC_FEC_MODE      = false
-SEGMENT_SIZE        = 2097152  
-FEC_SEGMENT_SIZE    = 2466816  
-THROUGHPUT_PERIOD = 0.1
-THROUGHPUT_WEIGHT = 0.1
-MULTIPATH_THRESHOLD_THROUGHPUT = 100.0
-MULTIPATH_THRESHOLD_SEND_COMPLETE_TIME = 0.0000000001
-CLOSE_TIMEOUT_PERIOD = 200
-`, myIP)
-	_, err = f.WriteString(fixedConfig)
-	if err != nil {
-		return err
-	}
-
-	// [[peer_addr]]
-	selfBlock := fmt.Sprintf(
-		"\n[[peer_addr]]  # Offset=0\nAddr = \"%s\"\nNumChild = %d\nChildOffset = 1\n",
-		myIP,
-		len(addrs),
-	)
-	_, err = f.WriteString(selfBlock)
-	if err != nil {
-		return err
-	}
-
-	// 2. 나머지 peer addr들 작성 (Offset=1부터 시작)
-	for i, addr := range addrs {
-		block := fmt.Sprintf(
-			"\n[[peer_addr]]  # Offset=%d\nAddr = \"%s\"\nNumChild = 0\nChildOffset = 0\n",
-			i+1, addr,
-		)
-		_, err := f.WriteString(block)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (w *CONSENSUSNODE) MP2BTPbftConsensus(userCount map[string]int) {
-	// Consensus Timer Setup
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(10)*time.Second)
-	defer cancel()
-
-	// Make a consensus message
-	w.auditMsg.BlkNum = w.roundIdx
-	w.auditMsg.LeaderID = w.selfId
-	w.auditMsg.PhaseNum = pb.AuditMsg_PREPARE
-	w.auditMsg.MerkleRootHash = "abcdefghijklmnopqrstuvwxyz"
-	w.auditMsg.AbortTransactionNum = userCount
-
-	// Calculate Block Hash Value, Current Hash Value is determined by the following 6 field values
-	// BlkNum, LeaderID, PhaseNum, MerkleRootHash, TxListm, PrevHash
-	if w.auditMsg.BlkNum == 1 {
-		w.auditMsg.CurHash = "ajknadajsnamajkndqwaakdmkaiwq"
-	} else {
-		b := lg.BlockHashCalculator(w.auditMsg)
-		h := sha512.Sum512(b)
-		w.auditMsg.CurHash = hex.EncodeToString(h[:63])
-	}
-
-	// Signing
-	hash := []byte(w.auditMsg.CurHash)
-	signing := sec.SignByte(hash)
-	byteSig := signing.Serialize()
-
-	w.auditMsg.Signature = byteSig
-
-	//  Who signed
-	w.auditMsg.HonestAuditors = append(w.auditMsg.HonestAuditors, w.selfId)
-
-	// [Send the first consensus message] Send sensus message to each w-node
-	// When the settlement time expires, the message transfer goroutin ends
-	ch1 := make(chan bool, len(w.members))
-
-	go w.MP2BTPSubmit(ch1, MP2BTPsession)
-
-	// 2f+1 messages must be processed to send a second consensus message
-	// [Second consensual message] Send consensus message to each w-node
-	// When the settlement time expires, the message transfer goroutin ends
-
+func (w *CONSENSUSNODE) waitForVotes(ch chan *pb.AuditMsg, quorum int, targetPhase pb.AuditMsg_Phases) bool {
 	votes := 0
+	var sigVec []bls.Sign
+
+	honestAuditorsSet := make(map[string]*pb.HonestAuditor)
+
 	for {
-		select {
-		case <-ch1:
-			votes += 1
+		msg := <-ch // blocking read
+		if msg == nil {
+			continue
 		}
-		if votes == len(w.members) {
-			break
+
+		sig := bls.Sign{}
+		if err := sig.Deserialize(msg.Signature); err != nil {
+			log.Println("❌ Signature deserialize error:", err)
+			continue
+		}
+
+		sigVec = append(sigVec, sig)
+		votes++
+		fmt.Printf("🗳️ Votes: %d/%d\n", votes, quorum)
+
+		for _, auditor := range msg.HonestAuditors {
+			if auditor != nil {
+				honestAuditorsSet[auditor.Id] = auditor
+			}
+		}
+
+		// map → slice로 변환
+		w.auditMsg.HonestAuditors = make([]*pb.HonestAuditor, 0, len(honestAuditorsSet))
+		for _, auditor := range honestAuditorsSet {
+			w.auditMsg.HonestAuditors = append(w.auditMsg.HonestAuditors, auditor)
+		}
+
+		if votes >= quorum {
+			fmt.Printf("✅ Phase %v Aggregation Complete\n", targetPhase)
+			w.Multisinging(msg, sigVec)
+			return true
 		}
 	}
-	<-ctx.Done()
-	fmt.Println("✅ 응답 받음1, 다음 작업 진행")
-
-	ch2 := make(chan bool, len(w.members))
-
-	go w.MP2BTPSubmit(ch2, MP2BTPsession)
-
-	// Final block commitment only if 2f+1 message is successful
-	// Send sensus message to each w-node
-	// to sync goroutines
-	votes = 0
-	for {
-		select {
-		case <-ch2:
-			votes += 1
-			fmt.Println("⭐️", votes)
-		}
-		if votes == len(w.members) {
-			fmt.Println(votes)
-			break
-		}
-		fmt.Println(votes)
-	}
-	<-ctx.Done()
-	fmt.Println("✅ 응답 받음2, 다음 작업 진행")
-
-	go w.MP2BTPSubmit(ch2, MP2BTPsession)
-
-	// when the consensus was successfully done, disseminate
-	// the block to the w-nodes.
-	gossibMsg := &pb.GossipMsg{}
-	gossibMsg.Type = 2
-	gossibMsg.Rndblk = w.auditMsg
-	wp2p.WDNMessage(wp2p.Wctx, wp2p.Shard[0], gossibMsg)
 }
+
+// ======================= Monitoring =======================
+// func monitoring() {
+// 	counter := prometheus.NewCounter(prometheus.CounterOpts{Namespace: "WDN", Name: "counter_total"})
+// 	gauge := prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "WDN", Name: "gauge_value"})
+// 	histogram := prometheus.NewHistogram(prometheus.HistogramOpts{
+// 		Namespace: "WDN", Name: "histogram_value", Buckets: prometheus.LinearBuckets(0, 5, 10),
+// 	})
+
+// 	prometheus.MustRegister(counter, gauge, histogram)
+
+// 	go func() {
+// 		for {
+// 			counter.Add(rand.Float64() * 5)
+// 			gauge.Add(rand.Float64()*15 - 5)
+// 			histogram.Observe(rand.Float64() * 10)
+// 			time.Sleep(2 * time.Second)
+// 		}
+// 	}()
+// 	fmt.Println(http.ListenAndServe(prometheusPort, nil))
+// }

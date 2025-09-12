@@ -91,12 +91,17 @@ int mclBn_getCurveType()
 
 int mclBn_getOpUnitSize()
 {
-	return (int)Fp::getUnitSize() * sizeof(mcl::fp::Unit) / sizeof(uint64_t);
+	return (int)Fp::getUnitSize() * sizeof(mcl::Unit) / sizeof(uint64_t);
 }
 
 int mclBn_getG1ByteSize()
 {
-	return mclBn_getFpByteSize();
+	return int(G1::getSerializedByteSize());
+}
+
+int mclBn_getG2ByteSize()
+{
+	return int(G2::getSerializedByteSize());
 }
 
 int mclBn_getFrByteSize()
@@ -134,6 +139,16 @@ int mclBn_getETHserialization()
 int mclBn_setMapToMode(int mode)
 {
 	return setMapToMode(mode) ? 0 : -1;
+}
+
+int mclBnG1_setDst(const char *dst, mclSize dstSize)
+{
+	return setDstG1(dst, dstSize) ? 0 : -1;
+}
+
+int mclBnG2_setDst(const char *dst, mclSize dstSize)
+{
+	return setDstG2(dst, dstSize) ? 0 : -1;
 }
 
 ////////////////////////////////////////////////
@@ -207,6 +222,10 @@ int mclBnFr_isOdd(const mclBnFr *x)
 int mclBnFr_isNegative(const mclBnFr *x)
 {
 	return cast(x)->isNegative();
+}
+int mclBnFr_cmp(const mclBnFr *x, const mclBnFr *y)
+{
+	return Fr::compare(*cast(x), *cast(y));
 }
 
 #ifndef MCL_DONT_USE_CSRPNG
@@ -383,6 +402,11 @@ int mclBnG1_hashAndMapTo(mclBnG1 *x, const void *buf, mclSize bufSize)
 	hashAndMapToG1(*cast(x), buf, bufSize);
 	return 0;
 }
+int mclBnG1_hashAndMapToWithDst(mclBnG1 *x, const void *buf, mclSize bufSize, const char *dst, mclSize dstSize)
+{
+	hashAndMapToG1(*cast(x), buf, bufSize, dst, dstSize);
+	return 0;
+}
 
 mclSize mclBnG1_getStr(char *buf, mclSize maxBufSize, const mclBnG1 *x, int ioMode)
 {
@@ -460,6 +484,11 @@ int mclBnG2_isValidOrder(const mclBnG2 *x)
 int mclBnG2_hashAndMapTo(mclBnG2 *x, const void *buf, mclSize bufSize)
 {
 	hashAndMapToG2(*cast(x), buf, bufSize);
+	return 0;
+}
+int mclBnG2_hashAndMapToWithDst(mclBnG2 *x, const void *buf, mclSize bufSize, const char *dst, mclSize dstSize)
+{
+	hashAndMapToG2(*cast(x), buf, bufSize, dst, dstSize);
 	return 0;
 }
 
@@ -541,6 +570,10 @@ int mclBnGT_isOne(const mclBnGT *x)
 {
 	return cast(x)->isOne();
 }
+int mclBnGT_isValid(const mclBnGT *x)
+{
+	return mcl::bn::isValidGT(*cast(x));
+}
 
 mclSize mclBnGT_getStr(char *buf, mclSize maxBufSize, const mclBnGT *x, int ioMode)
 {
@@ -594,17 +627,21 @@ void mclBnGT_powGeneric(mclBnGT *z, const mclBnGT *x, const mclBnFr *y)
 	Fp12::powGeneric(*cast(z), *cast(x), *cast(y));
 }
 
-void mclBnG1_mulVec(mclBnG1 *z, const mclBnG1 *x, const mclBnFr *y, mclSize n)
+void mclBnG1_mulVec(mclBnG1 *z, mclBnG1 *x, const mclBnFr *y, mclSize n)
 {
 	G1::mulVec(*cast(z), cast(x), cast(y), n);
 }
-void mclBnG2_mulVec(mclBnG2 *z, const mclBnG2 *x, const mclBnFr *y, mclSize n)
+void mclBnG2_mulVec(mclBnG2 *z, mclBnG2 *x, const mclBnFr *y, mclSize n)
 {
 	G2::mulVec(*cast(z), cast(x), cast(y), n);
 }
 void mclBnGT_powVec(mclBnGT *z, const mclBnGT *x, const mclBnFr *y, mclSize n)
 {
 	GT::powVec(*cast(z), cast(x), cast(y), n);
+}
+void mclBnG1_mulEach(mclBnG1 *x, const mclBnFr *y, mclSize n)
+{
+	G1::mulEach(cast(x), cast(y), n);
 }
 
 void mclBn_pairing(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y)
@@ -622,6 +659,18 @@ void mclBn_millerLoop(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y)
 void mclBn_millerLoopVec(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y, mclSize n)
 {
 	millerLoopVec(*cast(z), cast(x), cast(y), n);
+}
+void mclBn_millerLoopVecMT(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y, mclSize n, mclSize cpuN)
+{
+	millerLoopVecMT(*cast(z), cast(x), cast(y), n, cpuN);
+}
+void mclBnG1_mulVecMT(mclBnG1 *z, mclBnG1 *x, const mclBnFr *y, mclSize n, mclSize cpuN)
+{
+	G1::mulVecMT(*cast(z), cast(x), cast(y), n, cpuN);
+}
+void mclBnG2_mulVecMT(mclBnG2 *z, mclBnG2 *x, const mclBnFr *y, mclSize n, mclSize cpuN)
+{
+	G2::mulVecMT(*cast(z), cast(x), cast(y), n, cpuN);
 }
 int mclBn_getUint64NumToPrecompute(void)
 {
@@ -775,6 +824,10 @@ int mclBnFp_isNegative(const mclBnFp *x)
 {
 	return cast(x)->isNegative();
 }
+int mclBnFp_cmp(const mclBnFp *x, const mclBnFp *y)
+{
+	return Fp::compare(*cast(x), *cast(y));
+}
 
 int mclBnFp_setHashOf(mclBnFp *x, const void *buf, mclSize bufSize)
 {
@@ -830,3 +883,66 @@ int mclBnG1_getBasePoint(mclBnG1 *x)
 	return 0;
 }
 
+template<class F>
+static void F_pow(F& z, const F& x, const F& y)
+{
+	mcl::fp::Block b;
+	y.getBlock(b);
+	mcl::fp::powUnit(z, x, b.p, b.n);
+}
+
+void mclBnFr_pow(mclBnFr *z, const mclBnFr *x, const mclBnFr *y)
+{
+	F_pow(*cast(z), *cast(x), *cast(y));
+}
+
+void mclBnFp_pow(mclBnFp *z, const mclBnFp *x, const mclBnFp *y)
+{
+	F_pow(*cast(z), *cast(x), *cast(y));
+}
+
+template<class F>
+static int F_powArray(F& z, const F& x, const uint8_t *_y, mclSize ySize)
+{
+	if (ySize == 0) {
+		z = 1;
+		return 0;
+	}
+	const size_t maxSize = F::getByteSize();
+	if (ySize > maxSize) return -1;
+	const size_t yN = mcl::roundUp(maxSize, sizeof(mcl::Unit));
+	mcl::Unit *y = (mcl::Unit*)CYBOZU_ALLOCA(sizeof(mcl::Unit) * yN);
+	if (!mcl::fp::convertArrayAsLE(y, yN, _y, ySize)) return -1;
+	mcl::fp::powUnit(z, x, y, yN);
+	return 0;
+}
+
+int mclBnFr_powArray(mclBnFr *z, const mclBnFr *x, const uint8_t *y, mclSize ySize)
+{
+	return F_powArray(*cast(z), *cast(x), y, ySize);
+}
+
+int mclBnFp_powArray(mclBnFp *z, const mclBnFp *x, const uint8_t *y, mclSize ySize)
+{
+	return F_powArray(*cast(z), *cast(x), y, ySize);
+}
+
+mclSize mclBnFr_invVec(mclBnFr *y, const mclBnFr *x, mclSize n)
+{
+	return mcl::invVec(cast(y), cast(x), n);
+}
+
+mclSize mclBnFp_invVec(mclBnFp *y, const mclBnFp *x, mclSize n)
+{
+	return mcl::invVec(cast(y), cast(x), n);
+}
+
+void mclBnG1_normalizeVec(mclBnG1 *y, const mclBnG1 *x, mclSize n)
+{
+	mcl::ec::normalizeVec(cast(y), cast(x), n);
+}
+
+void mclBnG2_normalizeVec(mclBnG2 *y, const mclBnG2 *x, mclSize n)
+{
+	mcl::ec::normalizeVec(cast(y), cast(x), n);
+}

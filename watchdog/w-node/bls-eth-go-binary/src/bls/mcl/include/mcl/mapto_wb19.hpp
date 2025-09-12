@@ -37,7 +37,7 @@ struct PointT {
 
 template<class F> F PointT<F>::a_;
 template<class F> F PointT<F>::b_;
-template<class F> int PointT<F>::specialA_;
+template<class F> int PointT<F>::specialA_ = ec::local::GenericA;
 
 } // mcl::local
 
@@ -45,16 +45,29 @@ template<class Fp, class G1, class Fp2, class G2>
 struct MapTo_WB19 {
 	typedef local::PointT<Fp> E1;
 	typedef local::PointT<Fp2> E2;
+	struct Dst {
+		static const size_t maxDstLen = 64;
+		char dst[maxDstLen + 1];
+		size_t len;
+		bool set(const char *dst_, size_t len_)
+		{
+			if (len_ > maxDstLen) return false;
+			len = len_;
+			memcpy(dst, dst_, len_);
+			dst[len_] = '\0';
+			return true;
+		}
+	};
+	Dst dstG1;
+	Dst dstG2;
 	mpz_class sqrtConst; // (p^2 - 9) / 16
-	Fp2 g2A;
-	Fp2 g2B;
 	Fp2 root4[4];
 	Fp2 etas[4];
 	Fp2 xnum[4];
 	Fp2 xden[3];
 	Fp2 ynum[4];
 	Fp2 yden[4];
-	Fp g1A, g1B, g1c1, g1c2;
+	Fp g1c1, g1c2;
 	Fp g1xnum[12];
 	Fp g1xden[11];
 	Fp g1ynum[16];
@@ -64,17 +77,10 @@ struct MapTo_WB19 {
 	void init()
 	{
 		bool b;
-		g2A.a = 0;
-		g2A.b = 240;
-		g2B.a = 1012;
-		g2B.b = 1012;
-		E1::a_.clear();
-		E1::b_ = 4;
-		E1::specialA_ = ec::Zero;
-		E2::a_.clear();
-		E2::b_.a = 4;
-		E2::b_.b = 4;
-		E2::specialA_ = ec::Zero;
+		E2::a_.a = 0;
+		E2::a_.b = 240;
+		E2::b_.a = 1012;
+		E2::b_.b = 1012;
 		sqrtConst = Fp::getOp().mp;
 		sqrtConst *= sqrtConst;
 		sqrtConst -= 9;
@@ -115,9 +121,9 @@ struct MapTo_WB19 {
 			const char *B = "0x12e2908d11688030018b12e8753eee3b2016c1f0f24f4070a0b9c14fcef35ef55a23215a316ceaa5d1cc48e98e172be0";
 			const char *c1 = "0x680447a8e5ff9a692c6e9ed90d2eb35d91dd2e13ce144afd9cc34a83dac3d8907aaffffac54ffffee7fbfffffffeaaa";
 			const char *c2 = "0x3d689d1e0e762cef9f2bec6130316806b4c80eda6fc10ce77ae83eab1ea8b8b8a407c9c6db195e06f2dbeabc2baeff5";
-			g1A.setStr(&b, A);
+			E1::a_.setStr(&b, A);
 			assert(b); (void)b;
-			g1B.setStr(&b, B);
+			E1::b_.setStr(&b, B);
 			assert(b); (void)b;
 			g1c1.setStr(&b, c1);
 			assert(b); (void)b;
@@ -128,6 +134,12 @@ struct MapTo_WB19 {
 			assert(b); (void)b;
 		}
 		init_iso11();
+		const char *dst = "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
+		bool ret = dstG1.set(dst, strlen(dst));
+		assert(ret); (void)ret;
+		dst = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+		ret = dstG2.set(dst, strlen(dst));
+		assert(ret); (void)ret;
 	}
 	void initArray(Fp *dst, const char **s, size_t n) const
 	{
@@ -353,8 +365,8 @@ struct MapTo_WB19 {
 	// https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-07#appendix-D.3.5
 	void sswuG1(Fp& xn, Fp& xd, Fp& y, const Fp& u) const
 	{
-		const Fp& A = g1A;
-		const Fp& B = g1B;
+		const Fp& A = E1::a_;
+		const Fp& B = E1::b_;
 		const Fp& c1 = g1c1;
 		const Fp& c2 = g1c2;
 		const int Z = g1Z;
@@ -421,20 +433,20 @@ struct MapTo_WB19 {
 		den += den2;
 		Fp2 x0_num, x0_den;
 		Fp2::add(x0_num, den, 1);
-		x0_num *= g2B;
+		x0_num *= E2::b_;
 		if (den.isZero()) {
-			mul_xi(x0_den, g2A);
+			mul_xi(x0_den, E2::a_);
 		} else {
-			Fp2::mul(x0_den, -g2A, den);
+			Fp2::mul(x0_den, -E2::a_, den);
 		}
 		Fp2 x0_den2, x0_den3, gx0_den, gx0_num;
 		Fp2::sqr(x0_den2, x0_den);
 		Fp2::mul(x0_den3, x0_den2, x0_den);
 		gx0_den = x0_den3;
 
-		Fp2::mul(gx0_num, g2B, gx0_den);
+		Fp2::mul(gx0_num, E2::b_, gx0_den);
 		Fp2 tmp, tmp1, tmp2;
-		Fp2::mul(tmp, g2A, x0_num);
+		Fp2::mul(tmp, E2::a_, x0_num);
 		tmp *= x0_den2;
 		gx0_num += tmp;
 		Fp2::sqr(tmp, x0_num);
@@ -531,9 +543,7 @@ struct MapTo_WB19 {
 	}
 	void msgToG2(G2& out, const void *msg, size_t msgSize) const
 	{
-		const char *dst = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-		const size_t dstSize = strlen(dst);
-		msgToG2(out, msg, msgSize, dst, dstSize);
+		msgToG2(out, msg, msgSize, dstG2.dst, dstG1.len);
 	}
 	void FpToG1(G1& out, const Fp& u0, const Fp *u1 = 0) const
 	{
@@ -562,9 +572,7 @@ struct MapTo_WB19 {
 
 	void msgToG1(G1& out, const void *msg, size_t msgSize) const
 	{
-		const char *dst = "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
-		const size_t dstSize = strlen(dst);
-		msgToG1(out, msg, msgSize, dst, dstSize);
+		msgToG1(out, msg, msgSize, dstG1.dst, dstG1.len);
 	}
 };
 

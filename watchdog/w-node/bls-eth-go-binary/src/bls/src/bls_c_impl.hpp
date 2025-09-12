@@ -19,8 +19,8 @@ inline void GmulCT(G1& z, const G1& x, const Fr& y) { G1::mulCT(z, x, y); }
 inline void GmulCT(G2& z, const G2& x, const Fr& y) { G2::mulCT(z, x, y); }
 inline void Gneg(G1& y, const G1& x) { G1::neg(y, x); }
 inline void Gneg(G2& y, const G2& x) { G2::neg(y, x); }
-inline void GmulVec(G1& z, const G1* x, const Fr *y, mclSize n) { G1::mulVec(z, x, y, n); }
-inline void GmulVec(G2& z, const G2* x, const Fr *y, mclSize n) { G2::mulVec(z, x, y, n); }
+inline void GmulVec(G1& z, G1* x, const Fr *y, mclSize n) { G1::mulVec(z, x, y, n); }
+inline void GmulVec(G2& z, G2* x, const Fr *y, mclSize n) { G2::mulVec(z, x, y, n); }
 inline void hashAndMapToG(G1& z, const void *m, mclSize size) { hashAndMapToG1(z, m, size); }
 inline void hashAndMapToG(G2& z, const void *m, mclSize size) { hashAndMapToG2(z, m, size); }
 
@@ -107,6 +107,7 @@ int blsInit(int curve, int compiledTimeVar)
 		mclBn_setETHserialization(1);
 		g_P.setStr(&b, "1 3685416753713387016781088315183077757961620795782546409894578378688607592378376318836054947676345821548104185464507 1339506544944476473020471379941921221584933875938349620426543736416511423956333506472724655353366534992391756441569", 10);
 		mclBn_setMapToMode(MCL_MAP_TO_MODE_HASH_TO_CURVE_07);
+		blsSetETHmode(BLS_ETH_MODE_LATEST);
 	} else
 	{
 		mapToG1(&b, g_P, 1);
@@ -132,7 +133,7 @@ int blsInit(int curve, int compiledTimeVar)
 			Fp6& x6 = g_Qcoeff[i];
 			for (size_t j = 0; j < 6; j++) {
 				Fp& x = x6.getFp0()[j];
-				mcl::fp::Unit *p = const_cast<mcl::fp::Unit*>(x.getUnit());
+				mcl::Unit *p = const_cast<mcl::Unit*>(x.getUnit());
 				for (size_t k = 0; k < 4; k++) {
 					p[k] = QcoeffTblBN254[i][j][k];
 				}
@@ -207,7 +208,7 @@ void blsSign(blsSignature *sig, const blsSecretKey *sec, const void *m, mclSize 
 #ifdef BLS_ETH
 /*
 	e(P, sHm) == e(sP, Hm)
-	<=> finalExp(ML(P, sHm) * e(-sP, Hm)) == 1
+	<=> finalExp(ML(P, sHm) * ML(-sP, Hm)) == 1
 */
 bool isEqualTwoPairings(const G2& sHm, const G1& sP, const G2& Hm)
 {
@@ -253,7 +254,7 @@ int blsVerify(const blsSignature *sig, const blsPublicKey *pub, const void *m, m
 #endif
 }
 
-void blsMultiVerifySub(mclBnGT *e, blsSignature *aggSig, const blsSignature *sigVec, const blsPublicKey *pubVec, const char *msg, mclSize msgSize, const char *randVec, mclSize randSize, mclSize n)
+void blsMultiVerifySub(mclBnGT *e, blsSignature *aggSig, blsSignature *sigVec, const blsPublicKey *pubVec, const char *msg, mclSize msgSize, const char *randVec, mclSize randSize, mclSize n)
 {
 #ifdef BLS_ETH
 	const size_t N = 16;
@@ -324,7 +325,7 @@ int blsMultiVerifyFinal(const mclBnGT *e, const blsSignature *aggSig)
 	verify prod e(H(pubVec[i], msgToG2[i]) == e(P, sig)
 	@remark return 0 if some pubVec[i] is zero
 */
-int blsMultiVerify(const blsSignature *sigVec, const blsPublicKey *pubVec, const void *msgVec, mclSize msgSize, const void *randVec, mclSize randSize, mclSize n, int threadN)
+int blsMultiVerify(blsSignature *sigVec, const blsPublicKey *pubVec, const void *msgVec, mclSize msgSize, const void *randVec, mclSize randSize, mclSize n, int threadN)
 {
 #ifdef BLS_ETH
 	if (n == 0) return 0;
@@ -649,21 +650,20 @@ int blsPublicKeyIsValidOrder(const blsPublicKey *pub)
 template<class G>
 inline bool toG(G& Hm, const void *h, mclSize size)
 {
-#ifdef BLS_ETH
-	BN::hashAndMapToG2(Hm, h, size);
-	return true;
-#else
 	if (g_irtfHashAndMap) {
-		BN::hashAndMapToG1(Hm, h, size);
+		hashAndMapToG(Hm, h, size);
 		return true;
 	}
 	// backward compatibility
 	Fp t;
 	t.setArrayMask((const uint8_t *)h, size);
 	bool b;
+#ifdef BLS_ETH
+	BN::mapToG2(&b, Hm, Fp2(t, 0));
+#else
 	BN::mapToG1(&b, Hm, t);
-	return b;
 #endif
+	return b;
 }
 
 int blsVerifyAggregatedHashes(const blsSignature *aggSig, const blsPublicKey *pubVec, const void *hVec, size_t sizeofHash, mclSize n)
@@ -903,19 +903,19 @@ void blsSignatureMul(blsSignature *y, const blsSecretKey *x)
 	*cast(&y->v) *= *cast(&x->v);
 }
 
-void blsPublicKeyMulVec(blsPublicKey *z, const blsPublicKey *x, const blsSecretKey *y, mclSize n)
+void blsPublicKeyMulVec(blsPublicKey *z, blsPublicKey *x, const blsSecretKey *y, mclSize n)
 {
 	GmulVec(*cast(&z->v), cast(&x->v), cast(&y->v), n);
 }
 
-void blsSignatureMulVec(blsSignature *z, const blsSignature *x, const blsSecretKey *y, mclSize n)
+void blsSignatureMulVec(blsSignature *z, blsSignature *x, const blsSecretKey *y, mclSize n)
 {
 	GmulVec(*cast(&z->v), cast(&x->v), cast(&y->v), n);
 }
 
 mclSize blsGetOpUnitSize() // FpUint64Size
 {
-	return Fp::getUnitSize() * sizeof(mcl::fp::Unit) / sizeof(uint64_t);
+	return Fp::getUnitSize() * sizeof(mcl::Unit) / sizeof(uint64_t);
 }
 
 int blsGetCurveOrder(char *buf, mclSize maxBufSize)
@@ -1123,7 +1123,7 @@ void hashToFr(Fr *out, const cybozu::Sha256& h0, mclSize begin, mclSize n)
 }
 
 template<class T, class U>
-void aggregate(T& out, const cybozu::Sha256& h0, const U *vec, mclSize n)
+void aggregate(T& out, const cybozu::Sha256& h0, U *vec, mclSize n)
 {
 	out.clear();
 	const size_t N = 16;

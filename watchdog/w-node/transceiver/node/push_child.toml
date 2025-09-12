@@ -5,15 +5,15 @@ VERBOSE_MODE        = true
 
 # Network address
 NUM_MULTIPATH       = 1
-MY_IP_ADDRS         = ["117.16.244.33", "127.0.0.1"]  # First IP is a primary path 
-LISTEN_PORT         = 4000
-BIND_PORT           = 5000
+MY_IP_ADDRS         = ["117.16.244.33"]  # First IP is a primary path 
+LISTEN_PORT         = 4100
+BIND_PORT           = 5100
 
 # Enhanced QUIC
 EQUIC_ENABLE        = true
 EQUIC_PATH          = "./fectun"
 EQUIC_APP_SRC_PORT  = 6000
-EQUIC_APP_DST_PORT  = 5000
+EQUIC_APP_DST_PORT  = 4000
 EQUIC_TUN_SRC_PORT  = 7000
 EQUIC_TUN_DST_PORT  = 7000
 EQUIC_FEC_MODE      = false

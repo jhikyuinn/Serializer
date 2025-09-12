@@ -1,14 +1,15 @@
+#ifdef MCL_DUMP_JIT
+	#define MCL_BINT_ASM 0
+#endif
+#define MCL_DLL_EXPORT
 #include <mcl/op.hpp>
 #include <mcl/util.hpp>
 #include <cybozu/sha2.hpp>
 #include <cybozu/endian.hpp>
 #include <mcl/conversion.hpp>
-#if defined(__EMSCRIPTEN__) && MCL_SIZEOF_UNIT == 4
-#define USE_WASM
-#include "low_func_wasm.hpp"
-#endif
+#include <mcl/invmod.hpp>
 
-#if defined(MCL_STATIC_CODE) || defined(MCL_USE_XBYAK) || (defined(MCL_USE_LLVM) && (CYBOZU_HOST == CYBOZU_HOST_INTEL))
+#if defined(MCL_STATIC_CODE) || defined(MCL_USE_XBYAK) || (defined(MCL_USE_LLVM) && (CYBOZU_HOST == CYBOZU_HOST_INTEL)) || (MCL_BINT_ASM_X64 == 1)
 
 #ifdef MCL_USE_XBYAK
 	#define XBYAK_DISABLE_AVX512
@@ -18,7 +19,11 @@
 #endif
 
 #include "xbyak/xbyak_util.h"
-Xbyak::util::Cpu g_cpu;
+static const Xbyak::util::Cpu& getCpu()
+{
+	static Xbyak::util::Cpu cpu;
+	return cpu;
+}
 
 #ifdef MCL_STATIC_CODE
 #include "fp_static_code.hpp"
@@ -27,17 +32,16 @@ Xbyak::util::Cpu g_cpu;
 #include "fp_generator.hpp"
 #endif
 
-#endif
+#endif // MCL_STATIC_CODE
 
+#include "bint_impl.hpp"
 #include "low_func.hpp"
-#ifdef MCL_USE_LLVM
-#include "proto.hpp"
-#include "low_func_llvm.hpp"
-#endif
 #include <cybozu/itoa.hpp>
 #include <mcl/randgen.hpp>
+#include "llvm_proto.hpp"
 
 #ifdef _MSC_VER
+	#pragma warning(push)
 	#pragma warning(disable : 4127)
 #endif
 
@@ -199,6 +203,7 @@ void expand_message_xmd(uint8_t out[], size_t outSize, const void *msg, size_t m
 	}
 }
 
+#if 0
 
 #ifndef MCL_USE_VINT
 static inline void set_mpz_t(mpz_t& z, const Unit* p, int n)
@@ -217,7 +222,7 @@ static inline void set_mpz_t(mpz_t& z, const Unit* p, int n)
 /*
 	y = (1/x) mod op.p
 */
-static inline void fp_invOpC(Unit *y, const Unit *x, const Op& op)
+static inline void fp_invC(Unit *y, const Unit *x, const Op& op)
 {
 	const int N = (int)op.N;
 	bool b = false;
@@ -241,150 +246,120 @@ static inline void fp_invOpC(Unit *y, const Unit *x, const Op& op)
 #endif
 }
 
+static void fp_invOpC(Unit *y, const Unit *x, const Op& op)
+{
+	fp_invC(y, x, op);
+	if (op.isMont) op.fp_mul(y, y, op.R3, op.p);
+}
+#endif
+
 /*
 	inv(xR) = (1/x)R^-1 -toMont-> 1/x -toMont-> (1/x)R
 */
-static void fp_invMontOpC(Unit *y, const Unit *x, const Op& op)
+template<size_t N>
+static void fp_invMod(Unit *y, const Unit *x, const Op& op)
 {
-	fp_invOpC(y, x, op);
-	op.fp_mul(y, y, op.R3, op.p);
+	mcl::inv::exec<N>(*reinterpret_cast<const mcl::inv::InvModT<N>*>(op.im), y, x);
+	if (op.isMont) op.fp_mul(y, y, op.R3, op.p);
 }
 
-/*
-	large (N * 2) specification of AddPre, SubPre
-*/
-template<size_t N, bool enable>
-struct SetFpDbl {
-	static inline void exec(Op&) {}
+// set x = y unless y = 0
+template<typename T>
+void setSafe(T& x, T y)
+{
+	if (y != 0) x = y;
+}
+
+template<size_t N, bool supportDbl>
+struct SetOpt2 {
+	static inline void set(Op&) { }
 };
 
 template<size_t N>
-struct SetFpDbl<N, true> {
-	static inline void exec(Op& op)
+struct SetOpt2<N, true> {
+	static inline void set(Op& op)
 	{
-//		if (!op.isFullBit) {
-			op.fpDbl_addPre = AddPre<N * 2, Ltag>::f;
-			op.fpDbl_subPre = SubPre<N * 2, Ltag>::f;
-//		}
+		op.fpDbl_add = fpDblAddModT<N>;
+		op.fpDbl_sub = fpDblSubModT<N>;
 	}
 };
 
-template<size_t N, bool isFullBit>
-void Mul2(Unit *y, const Unit *x, const Unit *p)
+template<size_t N>
+void setOp(Op& op)
 {
-#ifdef MCL_USE_LLVM
-	Add<N, isFullBit, Ltag>::f(y, x, x, p);
+	// always use bint functions
+	op.fp_isZero = bint::isZeroT<N, Unit>;
+	op.fp_clear = bint::clearT<N>;
+	op.fp_copy = bint::copyT<N>;
+#if 1
+	mcl::inv::init(*reinterpret_cast<mcl::inv::InvModT<N>*>(op.im), op.mp);
+	op.fp_invOp = fp_invMod<N>;
 #else
-	const size_t bit = 1;
-	const size_t rBit = sizeof(Unit) * 8 - bit;
-	Unit tmp[N];
-	Unit prev = x[N - 1];
-	Unit H = isFullBit ? (x[N - 1] >> rBit) : 0;
-	for (size_t i = N - 1; i > 0; i--) {
-		Unit t = x[i - 1];
-		tmp[i] = (prev << bit) | (t >> rBit);
-		prev = t;
-	}
-	tmp[0] = prev << bit;
-	bool c;
-	if (isFullBit) {
-		H -= SubPre<N, Gtag>::f(y, tmp, p);
-		c = H >> rBit;
-	} else {
-		c = SubPre<N, Gtag>::f(y, tmp, p);
-	}
-	if (c) {
-		copyC<N>(y, tmp);
-	}
+	op.fp_invOp = fp_invOpC;
 #endif
-}
+	op.fp_mulUnit = mulUnitModT<N>;
+	op.fp_shr1 = shr1T<N>;
+	op.fp_neg = negT<N>;
+	op.fp_mulUnitPre = mulUnitPreT<N>;
+	op.mulSmallUnit = bint::SmallModP::mulUnit<N>;
+	op.fp_addPre = bint::get_add(N);
+	op.fp_subPre = bint::get_sub(N);
+	op.fpDbl_addPre = bint::get_add(N * 2);
+	op.fpDbl_subPre = bint::get_sub(N * 2);
+	op.fpDbl_mulPre = bint::get_mul(N);
+	op.fpDbl_sqrPre = bint::get_sqr(N);
 
-template<size_t N, class Tag, bool enableFpDbl, bool gmpIsFasterThanLLVM>
-void setOp2(Op& op)
-{
-	op.fp_shr1 = Shr1<N, Tag>::f;
-	op.fp_neg = Neg<N, Tag>::f;
 	if (op.isFullBit) {
-		op.fp_add = Add<N, true, Tag>::f;
-		op.fp_sub = Sub<N, true, Tag>::f;
-		op.fp_mul2 = Mul2<N, true>;
+		op.fp_add = addModT<N>;
+		op.fp_sub = subModT<N>;
+		setSafe(op.fp_add, get_llvm_fp_add(N));
+		setSafe(op.fp_sub, get_llvm_fp_sub(N));
 	} else {
-		op.fp_add = Add<N, false, Tag>::f;
-		op.fp_sub = Sub<N, false, Tag>::f;
-		op.fp_mul2 = Mul2<N, false>;
+		op.fp_add = addModNFT<N>;
+		op.fp_sub = subModNFT<N>;
+		setSafe(op.fp_add, get_llvm_fp_addNF(N));
+		setSafe(op.fp_sub, get_llvm_fp_subNF(N));
 	}
 	if (op.isMont) {
 		if (op.isFullBit) {
-			op.fp_mul = Mont<N, true, Tag>::f;
-			op.fp_sqr = SqrMont<N, true, Tag>::f;
-			op.fpDbl_mod = MontRed<N, true, Tag>::f;
+			op.fp_mul = mulMontT<N>;
+			op.fp_sqr = sqrMontT<N>;
+			op.fpDbl_mod = modRedT<N>;
+			setSafe(op.fp_mul, get_llvm_fp_mont(N));
+			setSafe(op.fp_sqr, get_llvm_fp_sqrMont(N));
+			setSafe(op.fpDbl_mod, get_llvm_fp_montRed(N));
 		} else {
-			op.fp_mul = Mont<N, false, Tag>::f;
-			op.fp_sqr = SqrMont<N, false, Tag>::f;
-			op.fpDbl_mod = MontRed<N, false, Tag>::f;
+			op.fp_mul = mulMontNFT<N>;
+			op.fp_sqr = sqrMontNFT<N>;
+			op.fpDbl_mod = modRedNFT<N>;
+			setSafe(op.fp_sqr, get_llvm_fp_sqrMontNF(N));
+			setSafe(op.fp_mul, get_llvm_fp_montNF(N));
+			setSafe(op.fpDbl_mod, get_llvm_fp_montRedNF(N));
 		}
 	} else {
-		op.fp_mul = Mul<N, Tag>::f;
-		op.fp_sqr = Sqr<N, Tag>::f;
-		op.fpDbl_mod = Dbl_Mod<N, Tag>::f;
+		op.fp_mul = mulModT<N>;
+		op.fp_sqr = sqrModT<N>;
+		op.fpDbl_mod = fpDblModT<N>;
 	}
-	op.fp_mulUnit = MulUnit<N, Tag>::f;
-	if (!gmpIsFasterThanLLVM) {
-		op.fpDbl_mulPre = MulPre<N, Tag>::f;
-		op.fpDbl_sqrPre = SqrPre<N, Tag>::f;
-	}
-	op.fp_mulUnitPre = MulUnitPre<N, Tag>::f;
-	op.fpN1_mod = N1_Mod<N, Tag>::f;
-	op.fpDbl_add = DblAdd<N, Tag>::f;
-	op.fpDbl_sub = DblSub<N, Tag>::f;
-	op.fp_addPre = AddPre<N, Tag>::f;
-	op.fp_subPre = SubPre<N, Tag>::f;
-	op.fp2_mulNF = Fp2MulNF<N, Tag>::f;
-	SetFpDbl<N, enableFpDbl>::exec(op);
-}
-
-template<size_t N>
-void setOp(Op& op, Mode mode)
-{
-	// generic setup
-	op.fp_isZero = isZeroC<N>;
-	op.fp_clear = clearC<N>;
-	op.fp_copy = copyC<N>;
-	if (op.isMont) {
-		op.fp_invOp = fp_invMontOpC;
-	} else {
-		op.fp_invOp = fp_invOpC;
-	}
-	setOp2<N, Gtag, true, false>(op);
-#ifdef MCL_USE_LLVM
-	if (mode != fp::FP_GMP && mode != fp::FP_GMP_MONT) {
-#if MCL_LLVM_BMI2 == 1
-		const bool gmpIsFasterThanLLVM = false;//(N == 8 && MCL_SIZEOF_UNIT == 8);
-		if (g_cpu.has(Xbyak::util::Cpu::tBMI2)) {
-			setOp2<N, LBMI2tag, (N * UnitBitSize <= 384), gmpIsFasterThanLLVM>(op);
-		} else
-#endif
-		{
-			setOp2<N, Ltag, (N * UnitBitSize <= 384), false>(op);
-		}
-	}
-#else
-	(void)mode;
-#endif
+	SetOpt2<N, (N * sizeof(Unit) * 8 <= 512)>::set(op);
+	setSafe(op.fpDbl_add, get_llvm_fpDbl_add(N));
+	setSafe(op.fpDbl_sub, get_llvm_fpDbl_sub(N));
 }
 
 #ifdef MCL_X64_ASM
 inline void invOpForMontC(Unit *y, const Unit *x, const Op& op)
 {
-	Unit r[maxUnitSize];
-	int k = op.fp_preInv(r, x);
+	int k = op.fp_preInv(y, x);
 	/*
 		S = UnitBitSize
 		xr = 2^k
+		if isMont:
 		R = 2^(N * S)
 		get r2^(-k)R^2 = r 2^(N * S * 2 - k)
+		else:
+		r 2^(-k)
 	*/
-	op.fp_mul(y, r, op.invTbl.data() + k * op.N, op.p);
+	op.fp_mul(y, y, op.invTbl.data() + k * op.N, op.p);
 }
 
 static void initInvTbl(Op& op)
@@ -393,13 +368,30 @@ static void initInvTbl(Op& op)
 	const Unit *p = op.p;
 	const size_t invTblN = N * sizeof(Unit) * 8 * 2;
 	op.invTbl.resize(invTblN * N);
-	Unit *tbl = op.invTbl.data() + (invTblN - 1) * N;
-	Unit t[maxUnitSize] = {};
-	t[0] = 2;
-	op.toMont(tbl, t);
-	for (size_t i = 0; i < invTblN - 1; i++) {
-		op.fp_add(tbl - N, tbl, tbl, p);
-		tbl -= N;
+	if (op.isMont) {
+		Unit t[maxUnitSize] = {};
+		t[0] = 2;
+		Unit *tbl = op.invTbl.data() + (invTblN - 1) * N;
+		op.toMont(tbl, t);
+		for (size_t i = 0; i < invTblN - 1; i++) {
+			op.fp_add(tbl - N, tbl, tbl, p);
+			tbl -= N;
+		}
+	} else {
+		/*
+			half = 1/2
+			tbl[i] = half^(i)
+		*/
+		Unit *tbl = op.invTbl.data();
+		memset(tbl, 0, sizeof(Unit) * N);
+		tbl[0] = 1;
+		mpz_class half = (op.mp + 1) >> 1;
+		bool b;
+		mcl::gmp::getArray(&b, tbl + N, N, half);
+		assert(b); (void)b;
+		for (size_t i = 2; i < invTblN; i++) {
+			op.fp_mul(tbl + N * i, tbl + N * (i-1), tbl + N, p);
+		}
 	}
 }
 #endif
@@ -420,7 +412,7 @@ static bool initForMont(Op& op, const Unit *p, Mode mode)
 		gmp::getArray(&b, op.R3, N, t);
 		if (!b) return false;
 	}
-	op.rp = getMontgomeryCoeff(p[0]);
+	op.rp = bint::getMontgomeryCoeff(p[0]);
 
 	(void)mode;
 #ifdef MCL_X64_ASM
@@ -430,22 +422,17 @@ static bool initForMont(Op& op, const Unit *p, Mode mode)
 	if (mode != FP_XBYAK) return true;
 #endif
 	if (op.fg == 0) op.fg = Op::createFpGenerator();
-	bool enableInv = op.fg->init(op, g_cpu);
+	op.fg->init(op, getCpu());
 #ifdef MCL_DUMP_JIT
 	return true;
 #endif
 #elif defined(MCL_STATIC_CODE)
 	if (mode != FP_XBYAK) return true;
 	fp::setStaticCode(op);
-	bool enableInv = true;
 #endif // MCL_USE_XBYAK
 
-#ifdef MCL_USE_VINT
-	const int maxInvN = 6;
-#else
 	const int maxInvN = 4;
-#endif
-	if (enableInv && op.isMont && N <= maxInvN) {
+	if (op.fp_preInv && N <= maxInvN) {
 		op.fp_invOp = &invOpForMontC;
 		initInvTbl(op);
 	}
@@ -453,38 +440,13 @@ static bool initForMont(Op& op, const Unit *p, Mode mode)
 	return true;
 }
 
-#ifdef USE_WASM
-template<size_t N>
-void setWasmOp(Op& op)
-{
-	if (!(op.isMont && !op.isFullBit)) return;
-//EM_ASM({console.log($0)}, N);
-//	op.fp_addPre = mcl::addT<N>;
-//	op.fp_subPre = mcl::subT<N>;
-//	op.fpDbl_addPre = mcl::addT<N * 2>;
-//	op.fpDbl_subPre = mcl::subT<N * 2>;
-	op.fp_add = mcl::addModT<N>;
-	op.fp_sub = mcl::subModT<N>;
-	op.fp_mul = mcl::mulMontT<N>;
-	op.fp_sqr = mcl::sqrMontT<N>;
-	op.fpDbl_mulPre = mulT<N>;
-//	op.fpDbl_sqrPre = sqrT<N>;
-	op.fpDbl_mod = modT<N>;
-}
-#endif
-
 bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size_t mclMaxBitSize)
 {
 	if (mclMaxBitSize != MCL_MAX_BIT_SIZE) return false;
-#ifdef MCL_USE_VINT
-	assert(sizeof(mcl::vint::Unit) == sizeof(Unit));
-#else
-	assert(sizeof(mp_limb_t) == sizeof(Unit));
-#endif
 	if (maxBitSize > MCL_MAX_BIT_SIZE) return false;
 	if (_p <= 0) return false;
 	clear();
-	maxN = (maxBitSize + fp::UnitBitSize - 1) / fp::UnitBitSize;
+	maxN = (maxBitSize + UnitBitSize - 1) / UnitBitSize;
 	N = gmp::getUnitSize(_p);
 	if (N > maxN) return false;
 	{
@@ -502,7 +464,7 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 */
 #ifdef MCL_X64_ASM
 	if (mode == FP_AUTO) mode = FP_XBYAK;
-	if (mode == FP_XBYAK && bitSize > 384) {
+	if (mode == FP_XBYAK && bitSize > 512) {
 		mode = FP_AUTO;
 	}
 #ifdef MCL_USE_XBYAK
@@ -513,7 +475,7 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 	{
 		// static jit code uses avx, mulx, adox, adcx
 		using namespace Xbyak::util;
-		if (!(g_cpu.has(Cpu::tAVX) && g_cpu.has(Cpu::tBMI2) && g_cpu.has(Cpu::tADX))) {
+		if (!(getCpu().has(Cpu::tAVX | Cpu::tBMI2 | Cpu::tADX))) {
 			mode = FP_AUTO;
 		}
 	}
@@ -528,17 +490,8 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 #endif
 	if (mode == FP_AUTO) mode = FP_GMP_MONT;
 	isMont = mode == FP_GMP_MONT || mode == FP_LLVM_MONT || mode == FP_XBYAK;
-#if 0
-	fprintf(stderr, "mode=%s, isMont=%d, maxBitSize=%d"
-#ifdef MCL_USE_XBYAK
-		" MCL_USE_XBYAK"
-#endif
-#ifdef MCL_USE_LLVM
-		" MCL_USE_LLVM"
-#endif
-	"\n", ModeToStr(mode), isMont, (int)maxBitSize);
-#endif
 	isFullBit = (bitSize % UnitBitSize) == 0;
+	isLtQuad = bitSize <= N * UnitBitSize - 2;
 
 #if defined(MCL_USE_LLVM) || defined(MCL_USE_XBYAK)
 	if (mode == FP_AUTO || mode == FP_LLVM || mode == FP_XBYAK) {
@@ -547,7 +500,9 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 			const char *str;
 		} tbl[] = {
 			{ PM_NIST_P192, "0xfffffffffffffffffffffffffffffffeffffffffffffffff" },
+#if MCL_MAX_BIT_SIZE >= 521
 			{ PM_NIST_P521, "0x1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+#endif
 		};
 		// use fastMode for special primes
 		for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(tbl); i++) {
@@ -563,8 +518,7 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 		}
 	}
 #endif
-#if defined(MCL_USE_VINT) && MCL_SIZEOF_UNIT == 8
-	if (mode != FP_LLVM && mode != FP_XBYAK) {
+	if (mode == FP_XBYAK || mode != FP_LLVM) {
 		const char *secp256k1Str = "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
 		bool b;
 		mpz_class secp256k1;
@@ -575,35 +529,31 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 			isFastMod = true;
 		}
 	}
-#endif
 	switch (N) {
-	case 192/(MCL_SIZEOF_UNIT * 8):  setOp<192/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 128/(MCL_SIZEOF_UNIT * 8):  setOp<128/(MCL_SIZEOF_UNIT * 8)>(*this); break;
+	case 192/(MCL_SIZEOF_UNIT * 8):  setOp<192/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #if (MCL_SIZEOF_UNIT * 8) == 32
-	case 224/(MCL_SIZEOF_UNIT * 8):  setOp<224/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 224/(MCL_SIZEOF_UNIT * 8):  setOp<224/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #endif
-	case 256/(MCL_SIZEOF_UNIT * 8):  setOp<256/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 256/(MCL_SIZEOF_UNIT * 8):  setOp<256/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #if MCL_MAX_BIT_SIZE >= 320
-	case 320/(MCL_SIZEOF_UNIT * 8):  setOp<320/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 320/(MCL_SIZEOF_UNIT * 8):  setOp<320/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #endif
 #if MCL_MAX_BIT_SIZE >= 384
-	case 384/(MCL_SIZEOF_UNIT * 8):  setOp<384/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 384/(MCL_SIZEOF_UNIT * 8):  setOp<384/(MCL_SIZEOF_UNIT * 8)>(*this); break;
+#endif
+#if MCL_MAX_BIT_SIZE >= 448
+	case 448/(MCL_SIZEOF_UNIT * 8):  setOp<448/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #endif
 #if MCL_MAX_BIT_SIZE >= 512
-	case 512/(MCL_SIZEOF_UNIT * 8):  setOp<512/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 512/(MCL_SIZEOF_UNIT * 8):  setOp<512/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #endif
 #if MCL_MAX_BIT_SIZE >= 576
-	case 576/(MCL_SIZEOF_UNIT * 8):  setOp<576/(MCL_SIZEOF_UNIT * 8)>(*this, mode); break;
+	case 576/(MCL_SIZEOF_UNIT * 8):  setOp<576/(MCL_SIZEOF_UNIT * 8)>(*this); break;
 #endif
 	default:
 		return false;
 	}
-#if defined(USE_WASM) && MCL_SIZEOF_UNIT == 4
-	if (N == 8) {
-		setWasmOp<8>(*this);
-	} else if (N == 12) {
-		setWasmOp<12>(*this);
-	}
-#endif
 #ifdef MCL_USE_LLVM
 	if (primeMode == PM_NIST_P192) {
 		fp_mul = &mcl_fp_mulNIST_P192L;
@@ -616,13 +566,11 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 	}
 #endif
 #endif
-#if defined(MCL_USE_VINT) && MCL_SIZEOF_UNIT == 8
-	if (primeMode == PM_SECP256K1) {
-		fp_mul = &mcl::vint::mcl_fp_mul_SECP256K1;
-		fp_sqr = &mcl::vint::mcl_fp_sqr_SECP256K1;
-		fpDbl_mod = &mcl::vint::mcl_fpDbl_mod_SECP256K1;
+	if (mode != FP_XBYAK && primeMode == PM_SECP256K1) {
+		fp_mul = &bint::mul_SECP256K1;
+		fp_sqr = &bint::sqr_SECP256K1;
+		fpDbl_mod = &bint::mod_SECP256K1;
 	}
-#endif
 	if (N * UnitBitSize <= 256) {
 		hash = sha256;
 	} else {
@@ -634,7 +582,8 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size
 		if (!b) return false;
 	}
 	modp.init(mp);
-	smallModp.init(mp);
+//	smallModp.init(mp);
+	smallModP.init(p, N);
 	return fp::initForMont(*this, p, mode);
 }
 
@@ -655,8 +604,8 @@ int detectIoMode(int ioMode, const std::ios_base& ios)
 
 static bool isInUint64(uint64_t *pv, const fp::Block& b)
 {
-	assert(fp::UnitBitSize == 32 || fp::UnitBitSize == 64);
-	const size_t start = 64 / fp::UnitBitSize;
+	assert(UnitBitSize == 32 || UnitBitSize == 64);
+	const size_t start = 64 / UnitBitSize;
 	for (size_t i = start; i < b.n; i++) {
 		if (b.p[i]) return false;
 	}
@@ -687,7 +636,7 @@ uint64_t getUint64(bool *pb, const fp::Block& b)
 int64_t getInt64(bool *pb, fp::Block& b, const fp::Op& op)
 {
 	bool isNegative = false;
-	if (fp::isGreaterOrEqualArray(b.p, op.half, op.N)) {
+	if (bint::cmpGeN(b.p, op.half, op.N)) {
 		op.fp_neg(b.v_, b.p, op.p);
 		b.p = b.v_;
 		isNegative = true;
@@ -719,3 +668,6 @@ int64_t getInt64(bool *pb, fp::Block& b, const fp::Op& op)
 
 } } // mcl::fp
 
+#ifdef _MSC_VER
+	#pragma warning(pop)
+#endif

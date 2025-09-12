@@ -12,8 +12,9 @@ message node {
     string addr = 2;
     string port = 3;
     bytes publickey = 4;
-    bool alive = 5;
-    string channel = 6;
+    string seed = 5;
+    bytes proof = 6;
+    bytes value =7;
 }
 
 message MemberMsg {

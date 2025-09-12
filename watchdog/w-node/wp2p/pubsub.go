@@ -34,19 +34,24 @@ func JoinNetwork(ctx context.Context, ps *pubsub.PubSub, pubsubTopic string, top
 		return nil, err
 	}
 
-	// and subscribe to it
-	sub, err := topic.Subscribe()
+	// subscribe separately for each handler
+	sub1, err := topic.Subscribe()
+	if err != nil {
+		return nil, err
+	}
+	sub2, err := topic.Subscribe()
+	if err != nil {
+		return nil, err
+	}
+	sub3, err := topic.Subscribe()
 	if err != nil {
 		return nil, err
 	}
 
-	if topicType == 1 {
-		go committeeHandler(ctx, sub)
-	} else if topicType == 2 {
-		go blockHandler(ctx, sub)
-	} else {
-		go pubsubHandler(ctx, sub)
-	}
+	// start handlers with their own subs
+	go committeeHandler(ctx, sub1)
+	go blockHandler(ctx, sub2)
+	go pubsubHandler(ctx, sub3)
 
 	return topic, nil
 }
@@ -121,8 +126,6 @@ func getOutboundIP() string {
 
 func committeeMessageHandler(id peer.ID, msg *SendMessage) {
 	json.Unmarshal(msg.Data, &CMsg)
-
-	// 📨📨 Recved CommitteeMsg including Type-1 Round Msg
 	if CMsg.Type == 1 {
 		sndBuf, _ := json.Marshal(CMsg)
 		for {
@@ -170,11 +173,10 @@ func committeeHandler(ctx context.Context, sub *pubsub.Subscription) {
 }
 
 func blockMessageHandler(id peer.ID, msg *SendMessage) {
-	json.Unmarshal(msg.Data, &CMsg)
+	json.Unmarshal(msg.Data, &GMsg)
 
-	// 📨📨 Recved CommitteeMsg including Type-1 Round Msg
-	if CMsg.Type == 2 {
-		sndBuf, _ := json.Marshal(CMsg)
+	if GMsg.Type == 2 {
+		sndBuf, _ := json.Marshal(GMsg)
 		for {
 			selfIP := getOutboundIP()
 			conn, err := net.Dial("tcp", selfIP+":5252")
