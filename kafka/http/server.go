@@ -165,6 +165,7 @@ func setupHandler(www string) http.Handler {
 	return mux
 }
 
+// 8000이 열려있지 않다보니, 8080으로 접근시 Quic오류가 발생.
 func Http3Listen() {
 	// defer profile.Start().Stop()
 	go func() {
@@ -179,7 +180,7 @@ func Http3Listen() {
 	flag.Parse()
 
 	if len(bs) == 0 {
-		bs = binds{":8000"}
+		bs = binds{":8082"}
 	}
 
 	handler := setupHandler(*www)

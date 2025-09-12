@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -20,10 +19,14 @@ import (
 
 	types "github.com/Watchdog-Network/types"
 	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/protoutil"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	// "google.golang.org/protobuf/proto"
+	"github.com/golang/protobuf/proto"
 
 	"github.com/lovoo/goka"
 	"github.com/lovoo/goka/codec"
@@ -62,7 +65,10 @@ var (
 var (
 	epsilonUrgent = 1.0
 	epsilonLow    = 1.0
+	re            = regexp.MustCompile(`User(\d+)`)
 )
+var wholeuser []string
+var shouldAbort = false
 
 type Graph struct {
 	edges map[int][]int
@@ -106,18 +112,37 @@ func (bc *blockCodec) Decode(data []byte) (interface{}, error) {
 func (bs *Blocks) process(ctx goka.Context, msg interface{}) {
 
 	// bs.PeerContribution.Record(ctx, msg)
-
 	key := ctx.Offset()
 	ctx.Loopback(strconv.Itoa(int(key)), msg)
+
+}
+
+type TxMeta struct {
+	Index   int
+	User    string
+	Reads   []string
+	Writes  []string
+	Urgency bool
 }
 
 func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
 	startelsaped := time.Now().UnixMilli()
 
-	var kafkadata []*common.Envelope
-	err := json.Unmarshal(msg.([]byte), &kafkadata)
+	var deserializedBatch [][]byte
+	err := json.Unmarshal(msg.([]byte), &deserializedBatch)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalf("Failed to unmarshal JSON: %v", err)
+	}
+
+	// protobuf 메시지로 변환
+	var kafkadata []*common.Envelope
+	for _, serializedEnv := range deserializedBatch {
+		env := &common.Envelope{}
+		err := proto.Unmarshal(serializedEnv, env)
+		if err != nil {
+			log.Fatalf("Failed to unmarshal envelope: %v", err)
+		}
+		kafkadata = append(kafkadata, env)
 	}
 
 	fmt.Println("[The length of Kafka incoming data]", len(kafkadata))
@@ -127,131 +152,115 @@ func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
 		return
 	}
 
-	var Ordereddata, Abortdata, Mediumdata, Lowdata []*common.Envelope
+	var OrderedData, AbortData, originalData []*common.Envelope
 
-	for _, data := range kafkadata {
-		payload, _ := protoutil.UnmarshalTransaction(data.Payload)
-		payloadStr := payload.String()
+	var txMetaList []TxMeta
 
-		if strings.Contains(payloadStr, `Query`) {
-			Ordereddata = append(Ordereddata, data)
-		} else if strings.Contains(payloadStr, `"Urgency\":true`) {
-			Mediumdata = append(Mediumdata, data)
-		} else {
-			Lowdata = append(Lowdata, data)
-		}
-	}
+	for i, data := range kafkadata {
+		payload := protoutil.UnmarshalPayloadOrPanic(data.Payload)
+		transaction, _ := protoutil.UnmarshalTransaction(payload.Data)
 
-	// ( 긴급한 트랜잭션을 먼저 정렬하고 Low를 따로 정렬하면 Low단에서 문제 발생하지 않나? )
-	if len(Mediumdata) > 0 {
-		SerialMediumTx, AbortMediumTx := epsilonOrdering(true, Mediumdata)
-		Ordereddata = append(Ordereddata, reverseArray(SerialMediumTx)...)
-		Abortdata = append(Abortdata, reverseArray(AbortMediumTx)...)
-	}
+		for _, action := range transaction.Actions {
+			first := true
+			chaincodeactionpayload, _ := protoutil.UnmarshalChaincodeActionPayload(action.Payload)
+			responsePayload, _ := protoutil.UnmarshalProposalResponsePayload(chaincodeactionpayload.Action.ProposalResponsePayload)
+			chaincodeaction, _ := protoutil.UnmarshalChaincodeAction(responsePayload.Extension)
 
-	// 낮은 우선순위 트랜잭션 처리
-	if len(Lowdata) > 0 {
-		SerialLowTx, AbortLowTx := epsilonOrdering(false, Lowdata)
-		Ordereddata = append(Ordereddata, reverseArray(SerialLowTx)...)
-		Abortdata = append(Abortdata, reverseArray(AbortLowTx)...)
-	}
-
-	marshalledOrdereddata, _ := json.Marshal(Ordereddata)
-	marshalledAbortdata, _ := json.Marshal(Abortdata)
-
-	ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), marshalledOrdereddata)
-	ctx.Emit(topicabort, strconv.Itoa(int(ctx.Offset())), marshalledAbortdata)
-
-	fmt.Println("[Total Time]", time.Now().UnixMilli()-startelsaped)
-
-}
-
-func epsilonOrdering(urgency bool, msg []*common.Envelope) (tSerial []*common.Envelope, tAbort []*common.Envelope) {
-
-	var NumactualorderTx = 0
-	// 미리 만들어놓은 유저의 크기에 맞게.
-	var Numdataitem = 4
-
-	// 급한 트랜잭션은 epsilon urgent값을 이용, 급하지 않다면 epsilon low 값을 이용
-	if urgency {
-		NumactualorderTx = int(math.Ceil(epsilonUrgent * float64(len(msg))))
-	} else {
-		NumactualorderTx = int(math.Ceil(epsilonLow * float64(len(msg))))
-	}
-
-	Conflictgraph := make([][]int, NumactualorderTx)
-	Readset := make([][]int, NumactualorderTx)
-	Writeset := make([][]int, NumactualorderTx)
-	Userset := make([]string, NumactualorderTx)
-
-	for i := 0; i < NumactualorderTx; i++ {
-		Conflictgraph[i] = make([]int, NumactualorderTx)
-		Readset[i] = make([]int, Numdataitem)
-		Writeset[i] = make([]int, Numdataitem)
-	}
-
-	re := regexp.MustCompile(`User(\d+)`)
-
-	for i := 0; i < NumactualorderTx; i++ {
-		payload, _ := protoutil.UnmarshalTransaction(msg[i].Payload)
-		matches := re.FindAllStringSubmatch(payload.String(), -1)
-
-		seen := make(map[string]bool, len(matches))
-		for _, match := range matches {
-			if len(match) > 1 {
-				seen[match[1]] = true
+			txRWSet := &rwsetutil.TxRwSet{}
+			if err = txRWSet.FromProtoBytes(chaincodeaction.Results); err != nil {
+				fmt.Println("RWSet unmarshal error:", err)
+				continue
 			}
-		}
-
-		// seen 맵에서 첫 번째 값을 얻음
-		var firstKey int
-		for key := range seen {
-			firstKey = idxToInt(key)
-			break
-		}
-		Userset[i] = fmt.Sprintf("User%d", firstKey)
-
-		// Readset과 Writeset을 설정
-		for key := range seen {
-			index := idxToInt(key) - 1
-			Readset[i][index] = 1
-			Writeset[i][index] = 1
-		}
-	}
-
-	for i := 0; i < NumactualorderTx; i++ {
-		for j := 0; j < Numdataitem; j++ {
-			if Readset[i][j] == 1 {
-				for k := 0; k < NumactualorderTx; k++ {
-					if Writeset[k][j] == 1 && k != i {
-						Conflictgraph[k][i] = 1
+			meta := TxMeta{Index: i}
+			for _, ns := range txRWSet.NsRwSets {
+				for _, r := range ns.KvRwSet.Reads {
+					if r.Key != "namespaces/fields/basic/Sequence" {
+						if first {
+							meta.User = r.Key
+							first = false
+						}
+						meta.Reads = append(meta.Reads, r.Key)
+					}
+				}
+				for _, w := range ns.KvRwSet.Writes {
+					meta.Writes = append(meta.Writes, w.Key)
+					if meta.User == "" && first {
+						meta.User = w.Key
+						first = false
+					}
+					var valMap map[string]interface{}
+					if err := json.Unmarshal(w.Value, &valMap); err == nil {
+						if userInfo, ok := valMap["UserInfo"].(map[string]interface{}); ok {
+							if urgency, ok := userInfo["Urgency"].(bool); ok && urgency {
+								meta.Urgency = true
+							}
+						}
 					}
 				}
 			}
+			txMetaList = append(txMetaList, meta)
+			originalData = append(originalData, data)
 		}
 	}
 
-	order, aborted := transactionScheduler(Userset, Conflictgraph)
+	var urgentList []TxMeta
+	var normalList []TxMeta
+	var committedUrgent []TxMeta
+	var urgentIdx []int
+	var normalIdx []int
 
-	for _, index := range order {
-		tSerial = append(tSerial, msg[index-1])
+	for _, meta := range txMetaList {
+		if len(meta.Reads) > 0 && len(meta.Writes) == 0 {
+			OrderedData = append(OrderedData, originalData[meta.Index])
+		} else if meta.Urgency {
+			urgentList = append(urgentList, meta)
+			urgentIdx = append(urgentIdx, meta.Index)
+		} else {
+			normalList = append(normalList, meta)
+			normalIdx = append(normalIdx, meta.Index)
+		}
+	}
+	if len(urgentList) > 0 {
+		serialIdx, abortIdx := epsilonOrdering(true, urgentList, epsilonUrgent)
+		fmt.Println(serialIdx, abortIdx)
+
+		for _, i := range serialIdx {
+			committedUrgent = append(committedUrgent, txMetaList[i])
+			OrderedData = append(OrderedData, originalData[i])
+		}
+		for _, i := range abortIdx {
+			AbortData = append(AbortData, originalData[i])
+		}
+		SaveAbortCount(urgentList, abortIdx)
 	}
 
-	for _, index := range aborted {
-		tAbort = append(tAbort, msg[index-1])
+	if len(normalList) > 0 {
+		serialTX, abortTX := checkbetweennormalandurgent(normalList, committedUrgent)
+		for _, tx := range abortTX {
+			AbortData = append(AbortData, originalData[tx.Index])
+		}
+		serialIdx, abortIdx := epsilonOrdering(false, serialTX, epsilonLow)
+		fmt.Println(serialIdx, abortIdx)
+
+		for _, i := range serialIdx {
+			OrderedData = append(OrderedData, originalData[i])
+		}
+		for _, i := range abortIdx {
+			AbortData = append(AbortData, originalData[i])
+		}
 	}
 
-	return tSerial, tAbort
+	// // 이 부분만 좀 더 함수에 영향을 받는게 아니라 1초마다 따딱 따딱 내보내는 식이면 더 좋을듯.
+
+	OrderedData = reverseArray(OrderedData)
+
+	marshalledOrdereddata, _ := json.Marshal(OrderedData)
+	marshalledAbortdata, _ := json.Marshal(AbortData)
+
+	ctx.Emit(topicabort, strconv.Itoa(int(ctx.Offset())), marshalledAbortdata)
+	ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), marshalledOrdereddata)
+	fmt.Println("[Total Time]", time.Now().UnixMilli()-startelsaped)
 }
-
-func idxToInt(s string) int {
-	num, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return num
-}
-
 func reverseArray(arr []*common.Envelope) []*common.Envelope {
 	reversed := make([]*common.Envelope, len(arr))
 	copy(reversed, arr)
@@ -261,72 +270,137 @@ func reverseArray(arr []*common.Envelope) []*common.Envelope {
 	return reversed
 }
 
-func (g *Graph) AddEdge(from, to int) {
-	if len(g.edges[from]) == 0 {
-		g.edges[from] = make([]int, 0, 10)
+func checkbetweennormalandurgent(normalList []TxMeta, committedUrgent []TxMeta) (serialIdx, abortIdx []TxMeta) {
+	committedUsers := make(map[string]struct{})
+	for _, tx := range committedUrgent {
+		committedUsers[tx.User] = struct{}{}
+		for _, w := range tx.Writes {
+			committedUsers[w] = struct{}{}
+		}
 	}
-	g.edges[from] = append(g.edges[from], to)
-}
 
-func (g *Graph) RemoveNode(node int) {
-	delete(g.edges, node)
-	for from, edges := range g.edges {
-		// 새로운 슬라이스로 필터링된 값을 저장
-		filteredEdges := edges[:0]
-		for _, to := range edges {
-			if to != node {
-				filteredEdges = append(filteredEdges, to)
+	for _, tx := range normalList {
+		conflict := false
+
+		if _, exists := committedUsers[tx.User]; exists {
+			conflict = true
+		}
+
+		if !conflict {
+			for _, w := range tx.Writes {
+				if _, exists := committedUsers[w]; exists {
+					conflict = true
+					break
+				}
 			}
 		}
-		g.edges[from] = filteredEdges
-	}
-}
 
-func hasCycleUtil(graph *Graph, node int, visited, recStack map[int]bool) bool {
-	if recStack[node] {
-		// 이미 순환을 찾았으면 바로 종료
-		return true
-	}
-	if visited[node] {
-		return false
-	}
-
-	visited[node] = true
-	recStack[node] = true
-
-	for _, neighbor := range graph.edges[node] {
-		if hasCycleUtil(graph, neighbor, visited, recStack) {
-			return true
+		if conflict {
+			abortIdx = append(abortIdx, tx)
+		} else {
+			serialIdx = append(serialIdx, tx)
 		}
 	}
 
-	recStack[node] = false
-	return false
+	return serialIdx, abortIdx
 }
 
-func detectCycle(graph *Graph) bool {
-	visited := make(map[int]bool, len(graph.edges))
-	recStack := make(map[int]bool, len(graph.edges))
+func BuildRWSetGraph(txList []TxMeta, keyCount int) (ConflictGraph [][]int) {
+	n := len(txList)
+	ConflictGraph = make([][]int, n)
+	Readset := make([][]int, n)
+	Writeset := make([][]int, n)
 
-	for node := range graph.edges {
-		if !visited[node] && hasCycleUtil(graph, node, visited, recStack) {
-			return true
+	for i := 0; i < n; i++ {
+		ConflictGraph[i] = make([]int, n)
+		Readset[i] = make([]int, keyCount)
+		Writeset[i] = make([]int, keyCount)
+
+		for _, key := range txList[i].Reads {
+			idx := idxToInt(key)
+			Readset[i][idx] = 1
+		}
+		for _, key := range txList[i].Writes {
+			idx := idxToInt(key)
+			Writeset[i][idx] = 1
 		}
 	}
-	return false
+
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i == j {
+				continue
+			}
+			for k := 0; k < keyCount; k++ {
+				// // Write → Read
+				// if Writeset[i][k] == 1 && Readset[j][k] == 1 {
+				// 	ConflictGraph[i][j] = 1
+				// }
+				// Read → Write
+				if Readset[i][k] == 1 && Writeset[j][k] == 1 {
+					ConflictGraph[i][j] = 1
+				}
+				// Write → Write
+				if Writeset[i][k] == 1 && Writeset[j][k] == 1 {
+					ConflictGraph[i][j] = 1
+				}
+			}
+		}
+	}
+
+	return ConflictGraph
+}
+
+func idxToInt(s string) int {
+	s = strings.TrimPrefix(s, "User")
+	num, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return num
+}
+
+// func epsilonOrdering(urgency bool, transactiongraph []TxMeta) (tSerial []*common.Envelope, tAbort []*common.Envelope) {
+func epsilonOrdering(urgency bool, transactiongraph []TxMeta, epsilon float64) (tSerialIndex []int, tAbortIndex []int) {
+
+	var Numkeyitem = 10000
+	ConflictGraph := BuildRWSetGraph(transactiongraph, Numkeyitem)
+
+	// var NumactualorderTx = int(math.Ceil(epsilonUrgent * float64(len(msg))))
+
+	// for i := range ConflictGraph {
+	// 	fmt.Println("Tx", transactiongraph[i].Index, "Conflict:", ConflictGraph[i])
+	// }
+	var txindexList []int
+	var userList []string
+	for _, tx := range transactiongraph {
+		txindexList = append(txindexList, tx.Index)
+		userList = append(userList, tx.User)
+	}
+	order, aborted := transactionScheduler(txindexList, userList, ConflictGraph)
+
+	return order, aborted
+
 }
 
 // 사용자의 트랜잭션 실패율을 최소화하도록 순서를 정렬
-func sortNodesByAbortInfo(size int, abortInfo interface{}) []int {
+func sortNodesByAbortInfo(size int, abortInfo interface{}, txToUser map[int]int) []int {
 	nodes := make([]int, 0, size)
 	for node := 1; node <= size; node++ {
 		nodes = append(nodes, node)
 	}
-
 	sort.Slice(nodes, func(i, j int) bool {
+		userI, existsI := txToUser[nodes[i]]
+		userJ, existsJ := txToUser[nodes[j]]
 
-		valueI := getAbortCount(abortInfo, fmt.Sprintf("User%d", nodes[i]))
-		valueJ := getAbortCount(abortInfo, fmt.Sprintf("User%d", nodes[j]))
+		if !existsI || !existsJ {
+			return false
+		}
+
+		valueI := getAbortCount(abortInfo, fmt.Sprintf("User%d", userI))
+		valueJ := getAbortCount(abortInfo, fmt.Sprintf("User%d", userJ))
+
+		// fmt.Println(nodes[i], "→ User", userI, nodes[j], "→ User", userJ, ":", valueI, valueJ)
 
 		return valueI < valueJ
 	})
@@ -347,110 +421,255 @@ func getAbortCount(abortInfo interface{}, user string) int32 {
 	return 0
 }
 
-func transactionScheduler(userinfo []string, matrix [][]int) ([]int, []int) {
+func checkConflict(graph *Graph, tx int) []int {
+	conflictingTx := []int{}
 
-	size := len(matrix)
-	graph := NewGraph(size)
-
-	for i := 0; i < size; i++ {
-		for j := 0; j < size; j++ {
-			if matrix[i][j] == 1 {
-				graph.AddEdge(i+1, j+1)
-			}
-		}
-	}
-
-	abortList := []int{}
-	abortListMap := make(map[int]bool)
-	abortInfo := UserabortInfoinWnode()
-
-	userToTransactions := make(map[int][]int)
-
-	for i, user := range userinfo {
-		userID := user[len(user)-1] - '0'
-		userToTransactions[int(userID)] = append(userToTransactions[int(userID)], i+1)
-	}
-
-	sortedNodes := sortNodesByAbortInfo(size, abortInfo)
-	for _, user := range sortedNodes {
-		transactions, exists := userToTransactions[user]
-		if !exists {
+	for node, neighbors := range graph.edges {
+		if node == tx {
 			continue
 		}
-
-		for _, tx := range transactions {
-			if abortListMap[tx] {
-				continue
-			}
-
-			if detectCycle(graph) {
-				abortListMap[tx] = true
-				graph.RemoveNode(tx)
-				abortList = append(abortList, tx)
-				fmt.Printf("Removed transaction %d (User: User%d)\n", tx, user)
-				break
-			} else {
-				fmt.Printf("Transaction %d (User: User%d) does not cause a cycle. Skipping.\n", tx, user)
+		for _, neighbor := range neighbors {
+			if neighbor == tx {
+				conflictingTx = append(conflictingTx, node) // 충돌이 발생한 트랜잭션을 기록
 			}
 		}
+	}
+	return conflictingTx
+}
+
+func (g *Graph) AddEdge(from, to int) {
+	if len(g.edges[from]) == 0 {
+		g.edges[from] = make([]int, 0, 10)
+	}
+	g.edges[from] = append(g.edges[from], to)
+}
+
+func (g *Graph) RemoveNode(node int) {
+	delete(g.edges, node)
+	for from, edges := range g.edges {
+		filteredEdges := edges[:0]
+		for _, to := range edges {
+			if to != node {
+				filteredEdges = append(filteredEdges, to)
+			}
+		}
+		g.edges[from] = filteredEdges
+	}
+}
+
+func updateDependencies(graph *Graph, removedTx int) {
+
+	for node, dependencies := range graph.edges {
+		newDeps := []int{}
+		for _, dep := range dependencies {
+			if dep != removedTx {
+				newDeps = append(newDeps, dep)
+			}
+		}
+		graph.edges[node] = newDeps
+	}
+}
+
+func transactionScheduler(txinfo []int, userinfo []string, matrix [][]int) ([]int, []int) {
+	size := len(matrix)
+	graph := NewGraph(size)
+	for _, tx := range txinfo {
+		graph.edges[tx] = []int{}
+	}
+	for i := 0; i < len(matrix); i++ {
+		for j := 0; j < len(matrix); j++ {
+			if matrix[i][j] == 1 {
+				from := txinfo[i]
+				to := txinfo[j]
+				graph.AddEdge(from, to)
+			}
+		}
+	}
+
+	txToUser := make(map[int]string)
+	for _, info := range userinfo {
+		parts := strings.Fields(info)
+		if len(parts) < 2 {
+			continue
+		}
+		txID, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		user := parts[1]
+		txToUser[txID] = user
 	}
 
 	successList := []int{}
-	for i := 1; i <= size; i++ {
-		if !abortListMap[i] {
-			successList = append(successList, i)
+	abortList := []int{}
+
+	abortInfo := GetAbortCounts()
+	fmt.Println(abortInfo)
+
+	for len(graph.edges) > 0 {
+		zeroInDegree := []int{}
+
+		for node := range graph.edges {
+			incoming := false
+			for _, neighbors := range graph.edges {
+				for _, to := range neighbors {
+					if to == node {
+						incoming = true
+						break
+					}
+				}
+				if incoming {
+					break
+				}
+			}
+			if !incoming {
+				zeroInDegree = append(zeroInDegree, node)
+			}
+		}
+
+		if len(zeroInDegree) == 0 {
+			var nodeToAbort int
+			for node := range graph.edges {
+				nodeToAbort = node
+				break
+			}
+			abortList = append(abortList, nodeToAbort)
+			graph.RemoveNode(nodeToAbort)
+			continue
+		}
+
+		for _, node := range zeroInDegree {
+			successList = append(successList, node)
+			graph.RemoveNode(node)
 		}
 	}
-
 	fmt.Println("SUC", successList)
 	fmt.Println("ABO", abortList)
-
 	return successList, abortList
 }
 
-func UserabortInfoinWnode() interface{} {
-	clientOptions := options.Client().ApplyURI("mongodb://127.0.0.1:27017")
+// func UserabortInfoinWnode() interface{} {
+// 	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+// 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// 	defer cancel()
+
+// 	client, err := mongo.Connect(ctx, clientOptions)
+// 	if err != nil {
+// 		log.Fatalf("Failed to connect to MongoDB: %v", err)
+// 	}
+// 	defer func() {
+// 		if err := client.Disconnect(ctx); err != nil {
+// 			log.Fatalf("Failed to disconnect MongoDB: %v", err)
+// 		}
+// 	}()
+// 	database := client.Database("User")
+// 	collection := database.Collection("abortTransaction")
+
+// 	opts := options.FindOne().SetSort(bson.D{{"_id", -1}})
+
+// 	var result bson.M
+// 	err = collection.FindOne(ctx, bson.D{}, opts).Decode(&result)
+// 	if err != nil {
+// 		if err == mongo.ErrNoDocuments {
+// 			fmt.Println("No documents found")
+// 		} else {
+// 			log.Fatalf("Failed to fetch latest document: %v", err)
+// 		}
+// 		return nil
+// 	}
+// 	if abortCount, exists := result["NumofAbortTransaction"]; exists {
+// 		fmt.Println(abortCount)
+// 		return abortCount
+// 	}
+
+// 	return nil
+// }
+
+func SaveAbortCount(txUsers []TxMeta, abortIDs []int) {
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
-		log.Fatalf("Failed to connect to MongoDB: %v", err)
+		log.Fatalf("MongoDB 연결 실패: %v", err)
 	}
-	defer func() {
-		if err := client.Disconnect(ctx); err != nil {
-			log.Fatalf("Failed to disconnect MongoDB: %v", err)
+	defer client.Disconnect(ctx)
+
+	collection := client.Database("User").Collection("abortTransaction")
+
+	// abort count 집계
+	abortCount := make(map[string]int)
+	for _, abortID := range abortIDs {
+		for _, tx := range txUsers {
+			if tx.Index == abortID {
+				abortCount[tx.User]++
+			}
 		}
-	}()
-	database := client.Database("User")
-	collection := database.Collection("abortTransaction")
+	}
 
-	opts := options.FindOne().SetSort(bson.D{{"_id", -1}})
-
-	var result bson.M
-	err = collection.FindOne(ctx, bson.D{}, opts).Decode(&result)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			fmt.Println("No documents found")
-		} else {
-			log.Fatalf("Failed to fetch latest document: %v", err)
+	// 유저별로 MongoDB에 누적 업데이트 (Upsert)
+	for user, count := range abortCount {
+		filter := bson.M{"user": user}
+		update := bson.M{"$inc": bson.M{"abortCount": count}}
+		opts := options.Update().SetUpsert(true)
+		_, err := collection.UpdateOne(ctx, filter, update, opts)
+		if err != nil {
+			log.Fatalf("MongoDB 업데이트 실패: %v", err)
 		}
-		return nil
-	}
-	if abortCount, exists := result["NumofAbortTransaction"]; exists {
-		return abortCount
 	}
 
-	return nil
 }
 
-func contains(list []int, value int) bool {
-	for _, v := range list {
-		if v == value {
-			return true
-		}
+// GetAbortCounts: 전체 유저별 누적 abortCount 조회
+func GetAbortCounts() map[string]int {
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		log.Fatalf("MongoDB 연결 실패: %v", err)
 	}
-	return false
+	defer client.Disconnect(ctx)
+
+	collection := client.Database("User").Collection("abortTransaction")
+
+	cursor, err := collection.Find(ctx, bson.M{})
+	if err != nil {
+		log.Fatalf("MongoDB 조회 실패: %v", err)
+	}
+	defer cursor.Close(ctx)
+
+	result := make(map[string]int)
+	for cursor.Next(ctx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			log.Fatalf("Decode 실패: %v", err)
+		}
+
+		// nil 체크 후 타입 변환
+		user, ok := doc["user"].(string)
+		if !ok || user == "" {
+			continue // user 필드 없으면 건너뜀
+		}
+
+		var count int
+		switch v := doc["abortCount"].(type) {
+		case int32:
+			count = int(v)
+		case int64:
+			count = int(v)
+		case int:
+			count = v
+		default:
+			count = 0
+		}
+
+		result[user] = count
+	}
+
+	return result
 }
 
 // Write a processor that consumes data from Kafka
