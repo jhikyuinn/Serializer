@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"strings"
 
 	"encoding/json"
 	"io"
@@ -17,26 +16,26 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/examples/data"
 
-	tx "validator/fabric-conn"
 	msp "validator/membership"
-	mp "validator/mempool"
 	pb "validator/msg"
 	wp2p "validator/wp2p"
 )
 
-type VALIDATOR struct {
-	IP string
+type Validator struct {
+    IP string `json:"ip"`
 }
 
 type server struct {
 	pb.UnimplementedMembershipServiceServer
 }
 
-var (
-	tls      = flag.Bool("tls", false, "Connection uses TLS if true, else plain TCP")
-	certFile = flag.String("cert_file", "", "The TLS cert file")
-	keyFile  = flag.String("key_file", "", "The TLS key file")
-)
+type NodeMeta struct {
+	LastSeen time.Time
+}
+
+const nodeTimeout = 10 * time.Second
+
+var NodeMetaMap = make(map[string]*NodeMeta)
 
 var myAddr string
 
@@ -49,135 +48,106 @@ func GetExternalIP() {
 
 	for {
 		conn, err := l.Accept()
-		if nil != err {
-			log.Println(err)
-			continue
-		}
+		if err != nil {
+            log.Println("Accept error:", err)
+            continue
+        }
 		go ConnHandler(conn)
 	}
 }
 
 func ConnHandler(conn net.Conn) {
-	recvBuf := make([]byte, 64)
 	defer conn.Close()
 
-	// the size of recv data is about 5 byte
+	recvBuf := make([]byte, 64)
 	n, err := conn.Read(recvBuf)
-	if nil != err {
-		if io.EOF == err {
-			log.Printf("connection is closed from client; %v", conn.RemoteAddr().String())
-			return
-		}
-		log.Printf("fail to receive data; err: %v", err)
+	if err != nil {
+		if err == io.EOF {
+            log.Printf("Connection closed by client: %v", conn.RemoteAddr())
+        } else {
+            log.Printf("Failed to read data: %v", err)
+        }
 		return
 	}
-	data := recvBuf[:n]
-	id := new(string)
+	var id string
+    if err := json.Unmarshal(recvBuf[:n], &id); err != nil {
+        log.Printf("JSON unmarshal error: %v", err)
+        return
+    }
 
-	json.Unmarshal(data, id)
-
-	// Change internal IP Address to external IP address
-	fmt.Println("Connected NODE_ID:", *id)
+	fmt.Println("Connected NODE_ID:", id)
 
 	msp.RwM.Lock()
 	defer msp.RwM.Unlock()
 
 	for idx, each := range msp.Membership.Nodes {
-		if each.NodeID == *id {
-			strtmp := conn.RemoteAddr().String()
-			slice := strings.Split(strtmp, ":")
-			msp.Membership.Nodes[idx].Addr = slice[0]
-			break
-		}
+		if each.NodeID == id {
+            ip, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+            if err != nil {
+                log.Println("Failed to parse remote address:", err)
+                return
+            }
+            msp.Membership.Nodes[idx].Addr = ip
+            break
+        }
 	}
 }
-
-func nodeExist(id string) bool {
-	for _, mem := range msp.Membership.Nodes {
-		if mem.NodeID == id {
-			return true
-		}
-	}
-	return false
-}
-
-func FabricHandler(conn net.Conn) {
-	recvBuf := make([]byte, 8192)
-
-	for {
-		n, err := conn.Read(recvBuf)
-		if nil != err {
-			if io.EOF == err {
-				log.Printf("connection is closed from client; %v", conn.RemoteAddr().String())
-				return
-			}
-			log.Printf("fail to receive data; err: %v", err)
-			return
-		}
-		data := recvBuf[:n]
-
-		if n < len(recvBuf) {
-			TxRecv := &mp.Fabric{}
-			json.Unmarshal(data, TxRecv)
-			// Keep fabric transactions in off-chain storage
-			tx.Insert(TxRecv)
-		} else {
-			log.Printf("data overlength")
-		}
-	}
-}
-
-type NodeMeta struct {
-	LastSeen time.Time
-}
-
-const nodeTimeout = 10 * time.Second
-
-var NodeMetaMap = make(map[string]*NodeMeta)
 
 func UpdateNode(node *pb.Node) {
+	now := time.Now()
 	msp.RwM.Lock()
 	defer msp.RwM.Unlock()
 
 	for i := range msp.Membership.Nodes {
 		if msp.Membership.Nodes[i].NodeID == node.NodeID {
-			NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: time.Now()}
+			msp.Membership.Nodes[i] = node
+
+			if meta, ok := NodeMetaMap[node.NodeID]; ok {
+				meta.LastSeen = now
+			} else {
+				NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: now}
+			}
 			return
-		} else {
-			fmt.Println("HELLO")
 		}
 	}
 
 	msp.Membership.Nodes = append(msp.Membership.Nodes, node)
-	NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: time.Now()}
-	fmt.Println("🆕 새로운 노드 추가:", node.NodeID)
+	NodeMetaMap[node.NodeID] = &NodeMeta{LastSeen: now}
+	fmt.Println("🆕 Add new node:", node.NodeID)
 }
 
 func IsNodeAlive(nodeID string) bool {
-	meta, ok := NodeMetaMap[nodeID]
-	if !ok {
-		return false
-	}
-	return time.Since(meta.LastSeen) <= nodeTimeout
+	msp.RwM.RLock()
+    meta, ok := NodeMetaMap[nodeID]
+    msp.RwM.RUnlock()
+
+    if !ok {
+        return false
+    }
+    return time.Since(meta.LastSeen) <= nodeTimeout
 }
 
 func RemoveDeadNodes() {
-	for {
-		time.Sleep(time.Second * 10)
+	ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
 
-		msp.RwM.Lock()
-		active := make([]*pb.Node, 0)
-		for _, node := range msp.Membership.Nodes {
-			if IsNodeAlive(node.NodeID) {
-				active = append(active, node)
-			} else {
-				fmt.Println("🗑️ 오래된 노드 제거:", node.NodeID)
-				delete(NodeMetaMap, node.NodeID)
-			}
-		}
-		msp.Membership.Nodes = active
-		msp.RwM.Unlock()
-	}
+	for range ticker.C {
+        now := time.Now()
+
+        msp.RwM.Lock()
+        alive := msp.Membership.Nodes[:0] 
+        for _, node := range msp.Membership.Nodes {
+            meta, ok := NodeMetaMap[node.NodeID]
+            if ok && now.Sub(meta.LastSeen) <= nodeTimeout {
+                alive = append(alive, node)
+            } else {
+                fmt.Println("🗑️ Removing inactive node:", node.NodeID)
+                delete(NodeMetaMap, node.NodeID)
+            }
+        }
+        msp.Membership.Nodes = alive
+        msp.RwM.Unlock()
+    }
 }
 
 // GRPC SERVICE
@@ -186,16 +156,11 @@ func (s *server) GetMembership(ctx context.Context, msg *pb.MemberMsg) (*pb.Memb
 		return nil, errors.New("no node information received")
 	}
 
-	node := &pb.Node{
-		NodeID:    msg.Nodes[0].NodeID,
-		Addr:      msg.Nodes[0].Addr,
-		Port:      msg.Nodes[0].Port,
-		Publickey: msg.Nodes[0].Publickey,
-		Seed:      msg.Nodes[0].Seed,
-		Proof:     msg.Nodes[0].Proof,
-		Value:     msg.Nodes[0].Value,
-	}
+	node := msg.Nodes[0]
 	UpdateNode(node)
+	fmt.Println("MSG INFO",msg.Nodes[0].Publickey)
+
+	msp.HandleMembershipRequest(msg)
 
 	msp.RwM.RLock()
 	defer msp.RwM.RUnlock()
@@ -203,35 +168,34 @@ func (s *server) GetMembership(ctx context.Context, msg *pb.MemberMsg) (*pb.Memb
 }
 
 func main() {
-	validatorAddr := flag.String("validator", "117.16.244.33", "")
-	kafkaprocessorAddr := flag.String("kafkaprocessor", "117.16.244.33", "")
+	validatorAddr := flag.String("validator", "117.16.244.33", "Validator IP address")
+    kafkaprocessorAddr := flag.String("kafkaprocessor", "117.16.244.33", "Kafka processor IP")
+    tls := flag.Bool("tls", false, "Use TLS for gRPC")
+    certFile := flag.String("cert_file", "", "TLS cert file")
+    keyFile := flag.String("key_file", "", "TLS key file")
 	flag.Parse()
 
-	myAddr = *validatorAddr
-	validator := VALIDATOR{
-		IP: myAddr,
-	}
-	fmt.Println("Host IP:", validator.IP)
+	validator := Validator{IP: *validatorAddr}
+    log.Println("Host IP:", validator.IP)
 
 	go RemoveDeadNodes()
+	time.Sleep(10 * time.Second)
 
-	time.Sleep(time.Second * 3)
-
-	// run libp2p that opens watchdog pubsub channel
+	// libp2p watchdog pubsub
 	wps := wp2p.WatchdogPubsub{}
 	go wps.Start(kafkaprocessorAddr)
 
-	// (Goroutine) Prepare for the next round based on the membership of the w-nodes
+	// Membership processor
 	msp.Start()
 
-	// (Goroutine) TCP Listener for updating IP Address of w-node
+	// TCP listener for updating external IPs
 	lis, err := net.Listen("tcp", myAddr+":16220")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	go GetExternalIP()
 
-	// (Goroutine) Exchanging membership message via GRPC
+	// --- gRPC server ---
 	var opts []grpc.ServerOption
 	if *tls {
 		if *certFile == "" {
@@ -248,5 +212,7 @@ func main() {
 	}
 	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterMembershipServiceServer(grpcServer, &server{})
-	grpcServer.Serve(lis)
+    if err := grpcServer.Serve(lis); err != nil {
+        log.Fatalf("gRPC server failed: %v", err)
+    }
 }
