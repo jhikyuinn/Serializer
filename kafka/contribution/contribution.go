@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"log"
 
 	types "github.com/Watchdog-Network/types"
 
@@ -85,7 +86,7 @@ func (fc *FabricChannel) Record(ctx goka.Context, msg interface{}) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	MongoURL := "mongodb://localhost:27017"
+	MongoURL := "mongodb://127.0.0.1:27017"
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(MongoURL))
 	if err != nil {
 		fmt.Println(err)
@@ -97,8 +98,15 @@ func (fc *FabricChannel) Record(ctx goka.Context, msg interface{}) {
 	var recvInfo FabricChannel
 
 	// if the channel is already exist, find that the peer was joined
+	data, ok := msg.([]byte)
+    if !ok {
+        log.Printf("unexpected type: %T", msg)
+        return
+    }
+    str := string(data) // ✅ []byte → string 변환
+    fmt.Println(str)
+
 	isChannelExist, r := fc.IsChannelExist(context.TODO(), msg.(string), collection)
-	fmt.Println(msg.(string))
 	if isChannelExist {
 		// appending peer contribution
 		if r["FabricPeers"] != nil {
@@ -173,7 +181,7 @@ func (fc *FabricChannel) consumer(brokers string) {
 			recvInfo.FabricPeers = []PeerAttribution{}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			MongoURL := "mongodb://localhost:27017"
+			MongoURL := "mongodb://127.0.0.1:27017"
 			client, err := mongo.Connect(ctx, options.Client().ApplyURI(MongoURL))
 			if err != nil {
 				fmt.Println(err)

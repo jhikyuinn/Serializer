@@ -25,7 +25,6 @@ func GetBlocks() {
 	insecure := flag.Bool("insecure", false, "skip certificate verification")
 
 	flag.Parse()
-	// urls := flag.Args()
 
 	pool, err := x509.SystemCertPool()
 	if err != nil {
@@ -39,7 +38,6 @@ func GetBlocks() {
 		TLSClientConfig: &tls.Config{
 			RootCAs:            pool,
 			InsecureSkipVerify: *insecure,
-			// KeyLogWriter:       keyLog,
 		},
 		QuicConfig: &qconf,
 	}

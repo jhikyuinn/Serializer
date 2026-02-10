@@ -3,7 +3,6 @@ package weavehttp
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"os"
 
 	_ "net/http/pprof"
 
@@ -41,45 +41,34 @@ type Size interface {
 	Size() int64
 }
 
-// See https://en.wikipedia.org/wiki/Lehmer_random_number_generator
-func generatePRData(l int) []byte {
-	res := make([]byte, l)
-	seed := uint64(1)
-	for i := 0; i < l; i++ {
-		seed = seed * 48271 % 2147483647
-		res[i] = byte(seed)
-	}
-	return res
-}
-
 var certPath string
 
 func init() {
-	//docker
-	// _, _, _, ok := runtime.Caller(0)
-	//direct
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		panic("Failed to get current frame")
-	}
-	// direct
-	certPath = path.Dir(filename)
+    _, filename, _, ok := runtime.Caller(0)
+    if !ok {
+        panic("Failed to get current frame")
+    }
+    certPath = path.Dir(filename)
 }
 
-// GetCertificatePaths returns the paths to certificate and key
 func GetCertificatePaths() (string, string) {
-	// docker
-	// return path.Join("./src/cert.pem"), path.Join("./src/priv.key")
-	// direct
-	return path.Join(certPath, "./testdata/cert.pem"), path.Join(certPath, "./testdata/priv.key")
-
+    if IsDocker() {
+        return path.Join("./src/cert.pem"), path.Join("./src/priv.key")
+    }
+    return path.Join(certPath, "./testdata/cert.pem"), path.Join(certPath, "./testdata/priv.key")
 }
 
-func setupHandler(www string) http.Handler {
+func IsDocker() bool {
+    if _, err := os.Stat("/.dockerenv"); err == nil {
+        return true
+    }
+    return false
+}
+
+func setupHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// fmt.Println(str.S)
 
 		// Small 40x40 png
 		w.Write([]byte{
@@ -122,20 +111,7 @@ func setupHandler(www string) http.Handler {
 		w.Write(jsonData)
 	})
 
-	mux.HandleFunc("/weave/blocks", func(w http.ResponseWriter, r *http.Request) {
-		// LOGIC: getting the number of fabric blocks
-	})
-
-	mux.HandleFunc("/weave/tx", func(w http.ResponseWriter, r *http.Request) {
-		// LOGIC: getting the number of fabric transactions
-	})
-
-	mux.HandleFunc("/weave/peers", func(w http.ResponseWriter, r *http.Request) {
-		// LOGIC: getting the number of joined peers and running peers
-	})
-
-	// LOGIC: getting peers' contribution
-	// Peer ID, amount of chunks, latest latency, and average latency
+	// Current not used.
 	mux.HandleFunc("/weave/contribution", func(w http.ResponseWriter, r *http.Request) {
 		MongoURL := "mongodb://127.0.0.1:27017"
 		client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(MongoURL))
@@ -165,42 +141,37 @@ func setupHandler(www string) http.Handler {
 	return mux
 }
 
-// 8000이 열려있지 않다보니, 8080으로 접근시 Quic오류가 발생.
-func Http3Listen() {
-	// defer profile.Start().Stop()
+func Http3Listen(bindAddr string, enableTCP bool) {
 	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			log.Printf("pprof server error: %v", err)
+		}
 	}()
-	// runtime.SetBlockProfileRate(1)
 
-	bs := binds{}
-	flag.Var(&bs, "bind", "bind to")
-	www := flag.String("www", "", "www data")
-	tcp := flag.Bool("tcp", false, "also listen on TCP")
-	flag.Parse()
-
-	if len(bs) == 0 {
-		bs = binds{":8082"}
+	if bindAddr == "" {
+		bindAddr = ":8082"
 	}
 
-	handler := setupHandler(*www)
+	handler := setupHandler()
 	quicConf := &quic.Config{}
 
-	bCap := bs[0]
-	fmt.Println(bCap)
+	certFile, keyFile := GetCertificatePaths()
+
 	var err error
-	if *tcp {
-		certFile, keyFile := GetCertificatePaths()
-		err = http3.ListenAndServe(bCap, certFile, keyFile, handler)
+	if enableTCP {
+		log.Printf("Starting HTTP/3 (TCP) server on %s", bindAddr)
+		err = http3.ListenAndServe(bindAddr, certFile, keyFile, handler)
 	} else {
+		log.Printf("Starting HTTP/3 (QUIC) server on %s", bindAddr)
 		server := http3.Server{
 			Handler:    handler,
-			Addr:       bCap,
+			Addr:       bindAddr,
 			QuicConfig: quicConf,
 		}
-		err = server.ListenAndServeTLS(GetCertificatePaths())
+		err = server.ListenAndServeTLS(certFile, keyFile)
 	}
+
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalf("Server error: %v", err)
 	}
 }
