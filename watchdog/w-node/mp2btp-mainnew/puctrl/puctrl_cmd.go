@@ -12,7 +12,10 @@ import (
 // Disable forwarding - flush iptables
 func DisablePacketForwarding() {
 	// Generated commands
+	//DOCKER
 	cmd := "iptables -t nat --flush"
+	// //LOCAL
+	// cmd := "sudo iptables -w 5 -t nat --flush"
 	cmdArgs := strings.Fields(cmd)
 	util.Log("PuCtrl.DisablePacketForwarding(): %s", cmd)
 	if err := RunCommand(cmdArgs[0], cmdArgs[1:]...); err != nil {
@@ -25,10 +28,16 @@ func DisablePacketForwarding() {
 // Enable forwarding
 func EnablePacketForwarding(index uint16, isPullSender bool) {
 	// Generated commands
+	// //DOCKER
 	cmdFmt := []string{
 		"iptables -t nat %s PREROUTING -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
 		"iptables -t nat %s OUTPUT -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
 	}
+	// //LOCAL
+	// cmdFmt := []string{
+	// 	"sudo iptables -w 5 -t nat %s PREROUTING -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
+	// 	"sudo iptables -w 5 -t nat %s OUTPUT -p udp --sport %d -s %s -j DNAT --to-destination %s:%d",
+	// }
 
 	cmd := make([]string, 2)
 
@@ -178,7 +187,8 @@ func RunEnhancedQuic(dstIpAddr []string, isReceiver bool, sessionType int, index
 	cmdArgs := strings.Fields(cmd)
 
 	if err := RunCommand(Conf.EQUIC_PATH, cmdArgs[0:]...); err != nil {
-		panic("PuCtrl.StartEnhancedQuic(): Enhanced QUIC Failed!")
+		fmt.Println(err)
+		// panic("PuCtrl.StartEnhancedQuic(): Enhanced QUIC Failed!")
 	}
 	util.Log("PuCtrl.StartEnhancedQuic(): Enhanced QUIC Started!")
 }

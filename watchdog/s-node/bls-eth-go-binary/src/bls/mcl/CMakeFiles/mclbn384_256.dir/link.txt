@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG  -shared -Wl,-soname,libmclbn384_256.so.1 -o lib/libmclbn384_256.so.1.22 CMakeFiles/mclbn384_256.dir/src/bn_c384_256.cpp.o  -Wl,-rpath,/home/dweb/Serializer/watchdog/s-node/bls-eth-go-binary/src/bls/mcl/lib: lib/libmcl.so.1.22 /usr/lib/x86_64-linux-gnu/libgmpxx.so /usr/lib/x86_64-linux-gnu/libgmp.so 

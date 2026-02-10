@@ -9,7 +9,7 @@
 
 #define MAX_NUM_PATH		2 
 #define UPPER_LAYER			999
-#define BUF_SIZE 			1460
+#define BUF_SIZE 			146000
 #define SOCKET_TIMEOUT		30
 #define THREAD_STACK_SIZE 	15 * 1024 * 1024
 #define TOTAL_BUCKET		100

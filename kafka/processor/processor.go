@@ -15,8 +15,6 @@ import (
 	"weave-kafka/contribution"
 	weavehttp "weave-kafka/http"
 
-	// contribution "weave-kafka/contribution"
-
 	types "github.com/Watchdog-Network/types"
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
@@ -25,22 +23,37 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	// "google.golang.org/protobuf/proto"
 	"github.com/golang/protobuf/proto"
 
 	"github.com/lovoo/goka"
 	"github.com/lovoo/goka/codec"
 )
 
+const (
+	TopicAbort  goka.Stream = "mychannel-abort"
+	TopicCommit goka.Stream = "mychannel-commit"
+	Group       goka.Group  = "mychannel-group"
+
+	EpsilonUrgent = 1.0
+	EpsilonLow    = 1.0
+)
+
+var (
+	re = regexp.MustCompile(`User(\d+)`)
+	tmc *goka.TopicManagerConfig
+
+	brokers1 string
+	brokers2 []string
+)
+
 type Blocks struct {
-	block            []Block
+	List             []Block
 	PeerContribution contribution.FabricChannel
 }
 
 type Block struct {
-	ChannelID    string
-	OutputStream goka.Stream
-
+	ChannelID        string
+	OutputStream     goka.Stream
 	Peers            []PeerInfo
 	PeerContribution contribution.FabricChannel
 }
@@ -50,37 +63,12 @@ type PeerInfo struct {
 	Sent int
 }
 
-var (
-	brokers1 string
-	brokers2 []string
-
-	topicabort  goka.Stream = "mychannel-abort"
-	topiccommit goka.Stream = "mychannel-commit"
-	group       goka.Group  = "mychannel-group"
-
-	emitted = false
-
-	tmc *goka.TopicManagerConfig
-)
-var (
-	epsilonUrgent = 1.0
-	epsilonLow    = 1.0
-	re            = regexp.MustCompile(`User(\d+)`)
-)
-var wholeuser []string
-var shouldAbort = false
-
 type Graph struct {
 	edges map[int][]int
 	users map[int]string
 }
 
-func NewGraph(size int) *Graph {
-	return &Graph{edges: make(map[int][]int)}
-}
-
-// This codec allows marshalling (encode) and unmarshalling (decode) the block struct(or produce struct) to and from the group table
-type blockCodec struct{}
+func NewGraph(size int) *Graph { return &Graph{edges: make(map[int][]int)} }
 
 func init() {
 	tmc = goka.NewTopicManagerConfig()
@@ -88,23 +76,26 @@ func init() {
 	tmc.Stream.Replication = 3
 }
 
-// Encodes types.StateData into []byte
-func (bc *blockCodec) Encode(value interface{}) ([]byte, error) {
-	if _, isState := value.(*types.StateData); !isState {
-		return nil, fmt.Errorf("codec requires value *types.StateData, got %T", value)
-	}
-	return json.Marshal(value)
+type blockCodec struct{}
+
+func newBlockCodec() *blockCodec {
+	return &blockCodec{}
 }
 
-// Decodes a types.StateData from []byte to it's go representation
+// Encode encodes *types.StateData into []byte
+func (bc *blockCodec) Encode(value interface{}) ([]byte, error) {
+	state, ok := value.(*types.StateData)
+	if !ok {
+		return nil, fmt.Errorf("blockCodec: expected *types.StateData, got %T", value)
+	}
+	return json.Marshal(state)
+}
+
+// Decode decodes []byte into *types.StateData
 func (bc *blockCodec) Decode(data []byte) (interface{}, error) {
-	var (
-		c   types.StateData
-		err error
-	)
-	err = json.Unmarshal(data, &c)
-	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling types.StateData: %v", err)
+	var c types.StateData
+	if err := json.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("blockCodec: unmarshal error: %w", err)
 	}
 	return &c, nil
 }
@@ -114,7 +105,6 @@ func (bs *Blocks) process(ctx goka.Context, msg interface{}) {
 	// bs.PeerContribution.Record(ctx, msg)
 	key := ctx.Offset()
 	ctx.Loopback(strconv.Itoa(int(key)), msg)
-
 }
 
 type TxMeta struct {
@@ -125,18 +115,27 @@ type TxMeta struct {
 	Urgency bool
 }
 
-func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
-	startelsaped := time.Now().UnixMilli()
+type TxData struct {
+	Timestamp int64    `json:"timestamp"`
+	Batch     [][]byte `json:"batch"`
+}
 
-	var deserializedBatch [][]byte
-	err := json.Unmarshal(msg.([]byte), &deserializedBatch)
+type AbortPayload struct {
+	Timestamp int64                `json:"timestamp"`
+	Data      []*common.Envelope `json:"data"`
+}
+
+func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
+	startelsaped:=time.Now().UnixMilli()
+
+	var transactionlist TxData
+	err := json.Unmarshal(msg.([]byte), &transactionlist)
 	if err != nil {
 		log.Fatalf("Failed to unmarshal JSON: %v", err)
 	}
-
-	// protobuf 메시지로 변환
+	
 	var kafkadata []*common.Envelope
-	for _, serializedEnv := range deserializedBatch {
+	for _, serializedEnv := range transactionlist.Batch {
 		env := &common.Envelope{}
 		err := proto.Unmarshal(serializedEnv, env)
 		if err != nil {
@@ -145,49 +144,59 @@ func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
 		kafkadata = append(kafkadata, env)
 	}
 
-	fmt.Println("[The length of Kafka incoming data]", len(kafkadata))
+	fmt.Println("[The length of Kafka incoming data]", len(kafkadata),transactionlist.Timestamp)
 	if len(kafkadata) == 1 {
-		hello, _ := json.Marshal(kafkadata)
-		ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), hello)
+		data, _ := json.Marshal(kafkadata)
+		ctx.Emit(TopicCommit, strconv.Itoa(int(ctx.Offset())), data)
 		return
 	}
 
-	var OrderedData, AbortData, originalData []*common.Envelope
-
-	var txMetaList []TxMeta
-
+	var (
+		originalDataCap = len(kafkadata) 
+		originalData    = make([]*common.Envelope, 0, originalDataCap)
+		OrderedData		= make([]*common.Envelope, 0, originalDataCap)
+		AbortData		= make([]*common.Envelope, 0, originalDataCap)
+		txMetaList      = make([]TxMeta, 0, originalDataCap)
+	)
+	
 	for i, data := range kafkadata {
 		payload := protoutil.UnmarshalPayloadOrPanic(data.Payload)
 		transaction, _ := protoutil.UnmarshalTransaction(payload.Data)
-
+	
 		for _, action := range transaction.Actions {
-			first := true
-			chaincodeactionpayload, _ := protoutil.UnmarshalChaincodeActionPayload(action.Payload)
-			responsePayload, _ := protoutil.UnmarshalProposalResponsePayload(chaincodeactionpayload.Action.ProposalResponsePayload)
-			chaincodeaction, _ := protoutil.UnmarshalChaincodeAction(responsePayload.Extension)
-
+			meta := TxMeta{Index: i}
+	
+			chaincodeActionPayload, _ := protoutil.UnmarshalChaincodeActionPayload(action.Payload)
+			responsePayload, _ := protoutil.UnmarshalProposalResponsePayload(chaincodeActionPayload.Action.ProposalResponsePayload)
+			chaincodeAction, _ := protoutil.UnmarshalChaincodeAction(responsePayload.Extension)
+	
 			txRWSet := &rwsetutil.TxRwSet{}
-			if err = txRWSet.FromProtoBytes(chaincodeaction.Results); err != nil {
+			if err = txRWSet.FromProtoBytes(chaincodeAction.Results); err != nil {
 				fmt.Println("RWSet unmarshal error:", err)
 				continue
 			}
-			meta := TxMeta{Index: i}
+	
+			firstKeyFound := false
+	
 			for _, ns := range txRWSet.NsRwSets {
 				for _, r := range ns.KvRwSet.Reads {
-					if r.Key != "namespaces/fields/basic/Sequence" {
-						if first {
-							meta.User = r.Key
-							first = false
-						}
-						meta.Reads = append(meta.Reads, r.Key)
+					if r.Key == "namespaces/fields/basic/Sequence" {
+						continue
 					}
+					if !firstKeyFound {
+						meta.User = r.Key
+						firstKeyFound = true
+					}
+					meta.Reads = append(meta.Reads, r.Key)
 				}
+	
 				for _, w := range ns.KvRwSet.Writes {
-					meta.Writes = append(meta.Writes, w.Key)
-					if meta.User == "" && first {
+					if !firstKeyFound {
 						meta.User = w.Key
-						first = false
+						firstKeyFound = true
 					}
+					meta.Writes = append(meta.Writes, w.Key)
+	
 					var valMap map[string]interface{}
 					if err := json.Unmarshal(w.Value, &valMap); err == nil {
 						if userInfo, ok := valMap["UserInfo"].(map[string]interface{}); ok {
@@ -198,69 +207,79 @@ func (bs *Blocks) loopProcess(ctx goka.Context, msg interface{}) {
 					}
 				}
 			}
+	
 			txMetaList = append(txMetaList, meta)
 			originalData = append(originalData, data)
 		}
 	}
 
-	var urgentList []TxMeta
-	var normalList []TxMeta
-	var committedUrgent []TxMeta
-	var urgentIdx []int
-	var normalIdx []int
-
+	var (
+		urgentList       []TxMeta
+		normalList       []TxMeta
+		committedUrgent  []TxMeta
+	)
 	for _, meta := range txMetaList {
-		if len(meta.Reads) > 0 && len(meta.Writes) == 0 {
+		switch {
+		case len(meta.Reads) > 0 && len(meta.Writes) == 0:
 			OrderedData = append(OrderedData, originalData[meta.Index])
-		} else if meta.Urgency {
+		case meta.Urgency:
 			urgentList = append(urgentList, meta)
-			urgentIdx = append(urgentIdx, meta.Index)
-		} else {
+		default:
 			normalList = append(normalList, meta)
-			normalIdx = append(normalIdx, meta.Index)
 		}
 	}
+
 	if len(urgentList) > 0 {
-		serialIdx, abortIdx := epsilonOrdering(true, urgentList, epsilonUrgent)
-		fmt.Println(serialIdx, abortIdx)
+		serialIdx, abortUrgent := epsilonOrdering(true, urgentList, EpsilonUrgent)
 
 		for _, i := range serialIdx {
 			committedUrgent = append(committedUrgent, txMetaList[i])
 			OrderedData = append(OrderedData, originalData[i])
 		}
-		for _, i := range abortIdx {
+		for _, i := range abortUrgent {
 			AbortData = append(AbortData, originalData[i])
 		}
-		SaveAbortCount(urgentList, abortIdx)
+		SaveAbortCount(urgentList, abortUrgent)
 	}
 
 	if len(normalList) > 0 {
-		serialTX, abortTX := checkbetweennormalandurgent(normalList, committedUrgent)
-		for _, tx := range abortTX {
+		serialTX, abortBetween := checkbetweennormalandurgent(normalList, committedUrgent)
+
+		for _, tx := range abortBetween {
 			AbortData = append(AbortData, originalData[tx.Index])
 		}
-		serialIdx, abortIdx := epsilonOrdering(false, serialTX, epsilonLow)
-		fmt.Println(serialIdx, abortIdx)
+
+		serialIdx, abortNormal := epsilonOrdering(false, serialTX, EpsilonLow)
 
 		for _, i := range serialIdx {
-			OrderedData = append(OrderedData, originalData[i])
+			OrderedData = append(OrderedData, originalData[serialTX[i].Index])
 		}
-		for _, i := range abortIdx {
-			AbortData = append(AbortData, originalData[i])
+		for _, i := range abortNormal {
+			AbortData = append(AbortData, originalData[serialTX[i].Index])
 		}
 	}
-
-	// // 이 부분만 좀 더 함수에 영향을 받는게 아니라 1초마다 따딱 따딱 내보내는 식이면 더 좋을듯.
 
 	OrderedData = reverseArray(OrderedData)
 
 	marshalledOrdereddata, _ := json.Marshal(OrderedData)
-	marshalledAbortdata, _ := json.Marshal(AbortData)
 
-	ctx.Emit(topicabort, strconv.Itoa(int(ctx.Offset())), marshalledAbortdata)
-	ctx.Emit(topiccommit, strconv.Itoa(int(ctx.Offset())), marshalledOrdereddata)
-	fmt.Println("[Total Time]", time.Now().UnixMilli()-startelsaped)
+	abortPayload := &AbortPayload{
+		Timestamp: time.Now().UnixMilli(),
+		Data:      make([]*common.Envelope, 0, len(AbortData)),
+	}
+
+	abortPayload.Data = append(abortPayload.Data, AbortData...)
+	marshalledAbortdata, err := json.Marshal(abortPayload)
+	if err != nil {
+		fmt.Printf("Failed to marshal abortPayload: %v\n", err)
+	}
+
+	ctx.Emit(TopicAbort, strconv.Itoa(int(ctx.Offset())), marshalledAbortdata)
+	ctx.Emit(TopicCommit, strconv.Itoa(int(ctx.Offset())), marshalledOrdereddata)
+	fmt.Println("[Total Ordering Time]", time.Now().UnixMilli()-startelsaped)
 }
+
+
 func reverseArray(arr []*common.Envelope) []*common.Envelope {
 	reversed := make([]*common.Envelope, len(arr))
 	copy(reversed, arr)
@@ -366,7 +385,7 @@ func epsilonOrdering(urgency bool, transactiongraph []TxMeta, epsilon float64) (
 	var Numkeyitem = 10000
 	ConflictGraph := BuildRWSetGraph(transactiongraph, Numkeyitem)
 
-	// var NumactualorderTx = int(math.Ceil(epsilonUrgent * float64(len(msg))))
+	// var NumactualorderTx = int(math.Ceil(EpsilonUrgent * float64(len(msg))))
 
 	// for i := range ConflictGraph {
 	// 	fmt.Println("Tx", transactiongraph[i].Index, "Conflict:", ConflictGraph[i])
@@ -675,87 +694,75 @@ func GetAbortCounts() map[string]int {
 // Write a processor that consumes data from Kafka
 func (bs *Blocks) runProcessor() {
 	channel := "mychannel-incoming"
-	// for {
-	// 	select {
-	// 	case channel := <-bs.PeerContribution.ChannelTrigger:
-	fmt.Println("New Channel:", channel)
+	fmt.Println("Starting processor for channel:", channel)
 	tm, err := goka.NewTopicManager(brokers2, goka.DefaultConfig(), tmc)
 	if err != nil {
 		log.Fatalf("Error creating topic manager: %v", err)
 	}
 	defer tm.Close()
-	err = tm.EnsureStreamExists(string(channel), 3)
-	if err != nil {
-		log.Printf("Error creating kafka topic %s: %v", topiccommit, err)
-	}
-	err = tm.EnsureStreamExists(string("mychannel-commit"), 3)
-	if err != nil {
-		log.Printf("Error creating kafka topic %s: %v", topiccommit, err)
+
+	for _, topic := range []goka.Stream{goka.Stream(channel), TopicCommit, TopicAbort} {
+		if err := tm.EnsureStreamExists(string(topic), 3); err != nil {
+			log.Printf("Error creating kafka topic %s: %v", topic, err)
+		}
 	}
 
-	func() {
-		initiating := make(chan struct{})
-		var newBlock Block
+	newBlock := Block{
+		ChannelID:    channel,
+		OutputStream: TopicAbort,
+	}
+	bs.List = append(bs.List, newBlock)
 
-		topicStream := goka.Stream(channel)
-		newBlock.ChannelID = channel
-		newBlock.OutputStream = goka.Stream("mychannel-abort")
+	group := goka.Group(channel + "-group")
+	g := goka.DefineGroup(
+		group,
+		goka.Input(goka.Stream(channel), new(codec.Bytes), bs.process),
+		goka.Loop(new(codec.Bytes), bs.loopProcess),
+		goka.Output(TopicCommit, new(codec.Bytes)),
+		goka.Output(TopicAbort, new(codec.Bytes)),
+		goka.Persist(new(blockCodec)),
+	)
 
-		bs.block = append(bs.block, newBlock)
-		group := goka.Group(channel + "-group")
-		g := goka.DefineGroup(group,
-			goka.Input(topicStream, new(codec.Bytes), bs.process), // function for receiving messages(stream) from Kafka
-			goka.Loop(new(codec.Bytes), bs.loopProcess),           // re-key using status
-			goka.Output(topiccommit, new(codec.Bytes)),
-			goka.Output(topicabort, new(codec.Bytes)),
-			goka.Persist(new(blockCodec)), // required for stateful-based data(table) processing
-		)
-		p, err := goka.NewProcessor(brokers2,
-			g,
-			goka.WithTopicManagerBuilder(goka.TopicManagerBuilderWithTopicManagerConfig(tmc)),
-			goka.WithConsumerGroupBuilder(goka.DefaultConsumerGroupBuilder),
-		)
-		if err != nil {
-			panic(err)
-		}
+	p, err := goka.NewProcessor(
+		brokers2,
+		g,
+		goka.WithTopicManagerBuilder(goka.TopicManagerBuilderWithTopicManagerConfig(tmc)),
+		goka.WithConsumerGroupBuilder(goka.DefaultConsumerGroupBuilder),
+	)
+	if err != nil {
+		fmt.Errorf("creating processor: %w", err)
+	}
 
-		close(initiating)
-
-		if err = p.Run(context.Background()); err != nil {
-			log.Printf("Error running processor: %v", err)
-		}
-	}()
+	p.Run(context.Background())
 }
 
 // Writing a view to query the user table
-func (bs *Blocks) runView(initialized chan struct{}) {
+func (bs *Blocks) runView(initialized chan struct{}) error {
 	<-initialized
 
 	channel := <-bs.PeerContribution.ChannelTrigger
 	group := goka.Group(channel + "-group")
-	view, err := goka.NewView(brokers2,
-		goka.GroupTable(group),
-		new(blockCodec),
-	)
+	view, err := goka.NewView(brokers2, goka.GroupTable(group), new(blockCodec))
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("creating view: %w", err)
 	}
-
-	view.Run(context.Background())
+	return view.Run(context.Background())
 }
 func main() {
 
-	// When this example is run the first time, wait for creation of all internal topics (this is done
-	// by goka.NewProcessor)
-	initialized := make(chan struct{})
-
-	kafka := flag.String("broker", "117.16.244.33", "")
+	kafka := flag.String("broker", "117.16.244.33", "Kafka broker")
+	bind := flag.String("bind", ":8082", "server bind address")
+    tcp := flag.Bool("tcp", false, "also listen on TCP")
 	flag.Parse()
 
 	brokers1 = "" + *kafka + ":9091, " + *kafka + ":9092, " + *kafka + ":9093" + ""
-	brokers2 = []string{*kafka + ":9091", *kafka + ":9092", *kafka + ":9093"}
+	brokers2 = []string{
+		fmt.Sprintf("%s:9091", *kafka),
+		fmt.Sprintf("%s:9092", *kafka),
+		fmt.Sprintf("%s:9093", *kafka),
+	}
 
-	go weavehttp.Http3Listen()
+	go weavehttp.Http3Listen(*bind,*tcp)
 
 	bs := Blocks{
 		PeerContribution: contribution.FabricChannel{
@@ -765,7 +772,16 @@ func main() {
 
 	go bs.PeerContribution.Start(brokers1)
 
-	go bs.runProcessor()
+	go func() {
+		bs.runProcessor()
+	}()
 
-	bs.runView(initialized)
+	initialized := make(chan struct{})
+	go func() {
+		if err := bs.runView(initialized); err != nil {
+			log.Fatalf("View error: %v", err)
+		}
+	}()
+
+	select {} 
 }

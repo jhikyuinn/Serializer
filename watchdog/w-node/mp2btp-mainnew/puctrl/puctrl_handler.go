@@ -20,6 +20,17 @@ func (p *PuCtrl) SendBlockInfo(sessionID uint32, blockNumber uint32) {
 	}
 }
 
+//KYUKYU
+func (p *PuCtrl) SendAuditInfo(sessionID uint32, data []byte) {
+	// Checks whether p.blockMap contains the requested block
+	p.sessionMap[sessionID].sendAuditDataPacket(data)
+}
+
+func (p *PuCtrl) SendAuditAckInfo(sessionID uint32, data []byte) {
+	// Checks whether p.blockMap contains the requested block
+	p.sessionMap[sessionID].sendAuditDataAckPacket(data)
+}
+
 // Send a Block Request
 func (p *PuCtrl) SendBlockRequest(sessionType byte, sessionID uint32, pkt *packet.BlockInfoPacket) {
 	// Update block number

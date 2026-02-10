@@ -31,8 +31,10 @@ func JoinNetwork(ctx context.Context, ps *pubsub.PubSub, pubsubTopic string, top
 	// join the pubsub topic
 	topic, err := ps.Join(pubsubTopic)
 	if err != nil {
+		fmt.Println(err)
 		return nil, err
 	}
+	
 
 	// subscribe separately for each handler
 	sub1, err := topic.Subscribe()

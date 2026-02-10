@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"time"
+	"io"
 
 	"github.com/MCNL-HGU/mp2btp/puctrl/packet"
 	"github.com/MCNL-HGU/mp2btp/puctrl/util"
@@ -24,7 +25,9 @@ func Listener(chStopListen <-chan bool) {
 	buf := make([]byte, 5)
 
 	myAddr := fmt.Sprintf("%s:%d", Conf.MY_IP_ADDRS[0], Conf.LISTEN_PORT)
+	// myAddr := fmt.Sprintf("0.0.0.0:%d", Conf.LISTEN_PORT)
 	listener, err := quic.ListenAddr(myAddr, tlsConfig, &quic.Config{})
+	
 	if err != nil {
 		panic(err)
 	}
@@ -72,6 +75,7 @@ func Listener(chStopListen <-chan bool) {
 }
 
 func Connector(src string, dst string, sessionType byte) *PuSession {
+	
 	// Bind source IP (my IP)
 	srcAddr, err := net.ResolveUDPAddr("udp", src)
 	if err != nil {
@@ -122,7 +126,8 @@ func Connector(src string, dst string, sessionType byte) *PuSession {
 			util.Log("PuSession.Connector(): Connection attempt to %s - %d failed!", dst, i+1)
 
 			if i == max_conn_retry-1 && err != nil {
-				panic(err)
+				fmt.Println(err)
+				// panic(err)
 			}
 			//time.Sleep(1 * time.Second)
 		}
@@ -135,10 +140,16 @@ func Connector(src string, dst string, sessionType byte) *PuSession {
 		}
 	}
 
+	if conn == nil || err != nil {
+		util.Log("quic dial failed: %s", err)
+		return nil
+	}
+	
 	// Get stream
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		panic(err)
+		util.Log("%s",err)
+		// panic(err)
 	}
 
 	// Convert session type and ID to byte slice
@@ -217,37 +228,69 @@ func (s *PuSession) handler() {
 	pushpulltransition := false
 
 	for {
-		// Read packet type and length (3 bytes)
-		pkt := make([]byte, packet.PACKET_SIZE)
-		n, err := s.readWithSize(pkt, 3)
-		if n == 0 {
-			pushpulltransition = true
-			break
-		}
-		if err != nil {
-			panic(err)
-		}
-		r := bytes.NewReader(pkt[:3])
-		pktType, _ := r.ReadByte()
-		pktLength, _ := util.ReadUint16(r)
-		if pktType == 0 && pktLength == 0 {
-			util.Log("PuSession[%d].handler(): Packet Type and Length read error! pkt=%v", s.sessionID, pkt[0:3])
-			break
-		}
-		// util.Log("PuSession[%d].handler(): Packet Type=%d, Length=%d", s.sessionID, pktType, pktLength)
 
-		// Read remaining packet data
-		n, err = s.readWithSize(pkt[3:pktLength], int(pktLength-3)) // Read after field of packet length
-		if n == 0 {
-			pushpulltransition = true
-			break
-		}
-		if err != nil {
-			panic(err)
-		}
+			header := make([]byte, 5)
+			if _, err := io.ReadFull(s.stream, header); err != nil { break }
 
-		// Parse packet
-		s.parsePacket(pktType, pkt)
+			pktType := header[0]
+			bodyLen := int(binary.LittleEndian.Uint32(header[1:5]))
+
+			if bodyLen <= 0 || bodyLen > packet.PACKET_SIZE {
+				util.Log("DESYNC: type=%d bodyLen=%d", pktType, bodyLen)
+				break
+			}
+
+			body := make([]byte, bodyLen)
+			if _, err := io.ReadFull(s.stream, body); err != nil { break }
+
+			pkt := append(header, body...)
+			s.parsePacket(pktType, pkt)
+
+
+		// // Read packet type and length (3 bytes)
+		// pkt := make([]byte, packet.PACKET_SIZE)
+		// n, err := s.readWithSize(pkt, 3)
+		// if n == 0 {
+		// 	// pushpulltransition = true
+		// 	break
+		// }
+		// if err != nil {
+		// 	panic(err)
+		// }
+		// r := bytes.NewReader(pkt[:3])
+		// pktType, _ := r.ReadByte()
+		// pktLength, _ := util.ReadUint16(r)
+		// if pktType == 0 && pktLength == 0 {
+		// 	util.Log("PuSession[%d].handler(): Packet Type and Length read error! pkt=%v", s.sessionID, pkt[0:3])
+		// 	break
+		// }
+		// // util.Log("PuSession[%d].handler(): Packet Type=%d, Length=%d", s.sessionID, pktType, pktLength)
+
+		// // Read remaining packet data
+		// if pktType == 23 {
+		// 	_, err = s.readWithSize(pkt[3:pktLength+7], int(pktLength+4)) // Read after field of packet length
+		// 	if err != nil {
+		// 		continue
+		// 	}
+
+		// } else if pktType == 24 {
+		// 	_, err = s.readWithSize(pkt[3:pktLength+7], int(pktLength+4)) // Read after field of packet length
+		// 	if err != nil {
+		// 		continue
+		// 	}
+		// } else {
+		// 	n, err = s.readWithSize(pkt[3:pktLength], int(pktLength-3)) // Read after field of packet length
+		// 	if n == 0 {
+		// 		// pushpulltransition = true
+		// 		break
+		// 	}
+		// 	if err != nil {
+		// 		panic(err)
+		// 	}
+		// }
+
+		// // Parse packet
+		// s.parsePacket(pktType, pkt)
 	}
 
 	if pushpulltransition {
@@ -289,9 +332,9 @@ func (s *PuSession) readWithSize(buf []byte, size int) (int, error) {
 			if n == 0 { // When it meets dedadline, transit push mode to pull mode
 				if s.puCtrl.peerPushMode && s.blockReceiving {
 					util.Log("PuSession[%d].readWithSize(): Deadline!!!", s.sessionID)
-				} else {
-					util.Log("PuSession[%d].readWithSize(): Deadline but block is not receiving! Continue to read!", s.sessionID)
-					continue
+				// } else {
+				// 	util.Log("PuSession[%d].readWithSize(): Deadline but block is not receiving! Continue to read!", s.sessionID)
+				// 	continue
 				}
 			}
 
@@ -308,7 +351,8 @@ func (s *PuSession) readWithSize(buf []byte, size int) (int, error) {
 }
 
 func (s *PuSession) parsePacket(pktType byte, data []byte) {
-	r := bytes.NewReader(data)
+	// r := bytes.NewReader(data)
+	r := bytes.NewReader(data[5:]) 
 
 	switch pktType {
 	// Block Find Packet
@@ -372,6 +416,22 @@ func (s *PuSession) parsePacket(pktType byte, data []byte) {
 			panic(err)
 		}
 		s.handleFinAckPacket(pkt)
+
+	case packet.AUDIT_MSG_PACKET:
+		pkt, err := packet.ParseAuditDataPacket(r)
+		if err != nil {
+			fmt.Println(err)
+			// panic(err)
+		}
+		s.handleAuditMsgPacket(pkt)
+	case packet.AUDIT_MSG_ACK_PACKET:
+		pkt, err := packet.ParseAuditDataAckPacket(r)
+		if err != nil {
+			fmt.Println(err)
+			// panic(err)
+		}
+		s.handleAuditMsgAckPacket(pkt)
+
 	// // Block Data ACK Packet
 	// case pc.BLOCK_DATA_ACK_PACKET:
 	// 	packet, err := pc.ParseBlockDataAckPacket(r)
@@ -464,6 +524,23 @@ func (s *PuSession) handlePathInfoAckPacket(pkt *packet.PathInfoPacket) {
 	// 	// Run Enhanced QUIC
 	// 	go s.RunEnhancedQuic(pkt.IP, isReceiver, s.index)
 	// }
+}
+
+//KYUKYU
+// Handle a Audit MSG Packet
+func (s *PuSession) handleAuditMsgPacket(pkt *packet.AuditDataPacket) {
+	util.Log("PuSession[%d].handleAuditMsgPacket()", s.sessionID)
+
+	s.puCtrl.ReceiveAuditMsg(s.sessionID, pkt)
+
+}
+
+// Handle a Audit MSG Ack Packet
+func (s *PuSession) handleAuditMsgAckPacket(pkt *packet.AuditDataAckPacket) {
+	util.Log("PuSession[%d].handleAuditMsgAckPacket()", s.sessionID)
+
+	s.puCtrl.ReceiveAuditMsgAck(s.sessionID, pkt)
+
 }
 
 // Handle a Block Find Packet
@@ -616,6 +693,55 @@ func (s *PuSession) sendBlockDataPacket(blockNumber uint32, dataNumber uint32, d
 	s.sendPacket(b.Bytes())
 }
 
+//KYUKYU
+func (s *PuSession) sendAuditDataPacket(data []byte) {
+
+	// pkt := packet.CreateAuditDataPacket(s.sessionID, data)
+	// util.Log("PuSession[%d].sendAuditDataPacket(): Length of data=%d", s.sessionID, len(data))
+
+	// b := &bytes.Buffer{}
+	// pkt.Write(b)
+
+	// // Send bytes of packet
+	// s.sendPacket(b.Bytes())
+
+	pkt := packet.CreateAuditDataPacket(s.sessionID, data)
+    util.Log("PuSession[%d].sendAuditDataPacket(): Length of data=%d",
+        s.sessionID, len(data))
+
+    // 2) AuditDataPacket → body bytes
+    bodyBuf := new(bytes.Buffer)
+    if err := pkt.Write(bodyBuf); err != nil {
+		fmt.Println(err)
+    }
+    body := bodyBuf.Bytes()
+
+    // 3) 프레임 헤더 + body 전송
+    if err := pkt.WriteFrame(s.stream, body); err != nil {
+		fmt.Println(err)
+    }
+
+}
+
+func (s *PuSession) sendAuditDataAckPacket(data []byte) {
+
+
+	pkt := packet.CreateAuditDataAckPacket(s.sessionID, data)
+	util.Log("PuSession[%d].CreateAuditDataAckPacket(): Length of data=%d",s.sessionID, len(data))
+
+    // 2) AuditDataPacket → body bytes
+    bodyBuf := new(bytes.Buffer)
+    if err := pkt.Write(bodyBuf); err != nil {
+		fmt.Println(err)
+    }
+    body := bodyBuf.Bytes()
+
+    // 3) 프레임 헤더 + body 전송
+    if err := pkt.WriteFrame(s.stream, body); err != nil {
+		fmt.Println(err)
+    }
+}
+
 // Send a FIN Packet
 func (s *PuSession) sendFinPacket(blockNumber uint32) {
 	pkt := packet.CreateFinPacket(s.sessionID, blockNumber)
@@ -679,10 +805,12 @@ func (s *PuSession) sendFinAckPacket(blockNumber uint32) {
 
 // Send a packet
 func (s *PuSession) sendPacket(buf []byte) {
-	//util.Log("PuSession[%d].sendPacket(): pkt=%v", s.sessionID, buf)
+	// util.Log("PuSession[%d].sendPacket(): pkt=%v", s.sessionID, buf)
 	_, err := s.stream.Write(buf)
 	if err != nil {
-		panic(err)
+		// panic(err)
+		fmt.Println(err)
+
 	}
 }
 

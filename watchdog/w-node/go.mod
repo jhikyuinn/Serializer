@@ -6,14 +6,12 @@ toolchain go1.23.9
 
 require (
 	github.com/BurntSushi/toml v1.3.2
-	github.com/MCNL-HGU/mp2btp v0.0.0-00010101000000-000000000000
+	github.com/MCNL-HGU/mp2btp v0.0.0
 	github.com/confluentinc/confluent-kafka-go/v2 v2.3.0
 	github.com/docbull/inlab-fabric-modules v0.0.0-20210415074300-d0809dab5b33
 	github.com/gogo/protobuf v1.3.2
 	github.com/golang/protobuf v1.5.4
 	github.com/herumi/bls-eth-go-binary v1.32.1
-	github.com/hyperledger/fabric v2.1.1+incompatible
-	github.com/hyperledger/fabric-protos-go v0.3.7
 	github.com/libp2p/go-libp2p v0.39.1
 	github.com/libp2p/go-libp2p-pubsub v0.13.1-0.20250218134146-b50197ee8bc7
 	github.com/multiformats/go-multiaddr v0.14.0
@@ -57,8 +55,6 @@ require (
 )
 
 require (
-	github.com/Knetic/govaluate v3.0.0+incompatible // indirect
-	github.com/Shopify/sarama v0.0.0-00010101000000-000000000000 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -75,10 +71,8 @@ require (
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/pprof v0.0.0-20250202011525-fc3143867406 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
-	github.com/hashicorp/go-version v1.7.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
-	github.com/hyperledger/fabric-amcl v0.0.0-20230602173724-9e02669dceb2 // indirect
 	github.com/ipfs/go-cid v0.5.0 // indirect
 	github.com/ipfs/go-log/v2 v2.5.1 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
@@ -98,11 +92,9 @@ require (
 	github.com/marten-seemann/tcp v0.0.0-20210406111302-dfbc87cc63fd // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/miekg/dns v1.1.63 // indirect
-	github.com/miekg/pkcs11 v1.1.1 // indirect
 	github.com/mikioh/tcpinfo v0.0.0-20190314235526-30a79bb1804b // indirect
 	github.com/mikioh/tcpopt v0.0.0-20190314235656-172688c1accc // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
-	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/montanaflynn/stats v0.0.0-20171201202039-1bf9dbcd8cbe // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/multiformats/go-base32 v0.1.0 // indirect
@@ -125,9 +117,7 @@ require (
 	github.com/quic-go/webtransport-go v0.8.1-0.20241018022711-4ac2c9250e66 // indirect
 	github.com/raulk/go-watchdog v1.3.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
-	github.com/spf13/viper v1.21.0 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/sykesm/zap-logfmt v0.0.4 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.1.2 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
@@ -151,6 +141,6 @@ require (
 
 replace github.com/Shopify/sarama => github.com/IBM/sarama v1.45.1
 
-replace github.com/MCNL-HGU/mp2btp => ./mp2btp-main
+replace github.com/herumi/bls-eth-go-binary/bls => ./bls-eth-go-binary/bls
 
-replace github.com/herumi/bls-eth-go-binary/bls => ./bls-eth-go-binary
+replace github.com/MCNL-HGU/mp2btp => ./mp2btp-mainnew

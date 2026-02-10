@@ -1,0 +1,12 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/dweb/Serializer/watchdog/s-node/bls-eth-go-binary/src/bls/mcl/src/asm/x86-64.bmi2.s
+
+/home/dweb/Serializer/watchdog/s-node/bls-eth-go-binary/src/bls/mcl/src/asm/x86-64.s
+

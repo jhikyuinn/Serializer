@@ -13,7 +13,7 @@
 #include "queue.h"
 
 #define RAPTOR_PACKET_HDR_LEN   4 * 7   // 4 * 7 = 28 bytes
-#define PAYLOAD_SIZE            1460    // To be verified whether 1460 is sufficient. 
+#define PAYLOAD_SIZE            146000    // To be verified whether 1460 is sufficient. 
 #define SOURCE_SYMBOL           0
 #define REDUNDANT_SYMBOL        1
 #define DECODE_EXPIRE_TIME      100     // milliseconds

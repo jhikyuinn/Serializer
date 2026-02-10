@@ -1,0 +1,80 @@
+package packet
+
+import (
+	"bytes"
+	"io"
+
+	"github.com/MCNL-HGU/mp2btp/puctrl/util"
+	"encoding/binary"
+)
+
+type AuditDataPacket struct {
+	Type      byte
+	Length    uint32
+	SessionID uint32
+
+	Data []byte
+}
+
+func CreateAuditDataPacket(sessionID uint32, data []byte) *AuditDataPacket {
+	packet := AuditDataPacket{}
+	packet.Type = AUDIT_MSG_PACKET
+	packet.Length = uint32(len(data))
+	packet.SessionID = sessionID
+
+	packet.Data = make([]byte, len(data))
+	copy(packet.Data, data)
+
+	return &packet
+}
+
+func ParseAuditDataPacket(r *bytes.Reader) (*AuditDataPacket, error) {
+
+	packetType, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	packetLegnth, err := util.ReadUint32(r)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionID, err := util.ReadUint32(r)
+	if err != nil {
+		return nil, err
+	}
+
+	packet := &AuditDataPacket{}
+	packet.Type = packetType
+	packet.Length = packetLegnth
+	packet.SessionID = sessionID
+	packet.Data = make([]byte, packetLegnth)
+	if _, err := io.ReadFull(r, packet.Data); err != nil {
+		return nil, err
+	}
+
+	return packet, nil
+}
+
+// Write Block Data ACK Packet
+func (p *AuditDataPacket) Write(b *bytes.Buffer) error {
+	b.WriteByte(p.Type)
+	util.WriteUint32(b, uint32(p.Length))
+	util.WriteUint32(b, uint32(p.SessionID))
+	b.Write(p.Data)
+
+	return nil
+}
+
+func (p *AuditDataPacket) WriteFrame(w io.Writer, body []byte) error {
+    hdr := make([]byte, 5)
+    hdr[0] = p.Type
+    binary.LittleEndian.PutUint32(hdr[1:5], uint32(len(body))) // bodyLen
+
+    if _, err := w.Write(hdr); err != nil {
+        return err
+    }
+    _, err := w.Write(body)
+    return err
+}
