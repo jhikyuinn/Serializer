@@ -15,26 +15,28 @@ message auditMsg {
   uint32 blkNum = 1;
   string prevHash = 2;
   string MerkleRootHash = 3;
-  
+  string time = 4;
+  string timeConstant = 5;
   string curHash = 6;
   string leaderID = 7;
   bytes signature = 8;
   repeated honestAuditor honestAuditors = 9;
 
   enum Phases {
-    PREPARE = 0;
-    AGGREGATED_PREPARE = 1;
-    COMMIT = 2;
-    AGGREGATED_COMMIT = 3;
+    PHASE_UNSPECIFIED = 0; // 값이 안 세팅된 경우 구분용
+    PREPARE = 1;
+    AGGREGATED_PREPARE = 2;
+    COMMIT = 3;
+    AGGREGATED_COMMIT = 4;
   }
-
   Phases phaseNum = 10;
   repeated bytes txList = 11;
+  map<string, int32> aborttransactionnum = 12;
 }
 
 message wnode {
   string nodeID = 1;
-  string addr = 2;
+  repeated string addrs = 2;  
   string port = 3;
   bytes publickey = 4;
   string seed = 5;
@@ -56,7 +58,7 @@ message committeeMsg {
 
 message committee {
     string nodeID = 1;
-    string addr = 2;
+    repeated string addrs = 2;  
     string port = 3;
     bytes publickey = 4;
 }
@@ -84,4 +86,5 @@ message gossipMsg {
     roundMsg rndMsg = 3;
     auditMsg rndblk = 4;
     string channel = 5;
+    int64 startConsensusTime =6;
 }

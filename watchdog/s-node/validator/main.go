@@ -11,6 +11,8 @@ import (
 	"io"
 	"net"
 	"time"
+	
+	"google.golang.org/protobuf/proto"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -82,12 +84,14 @@ func ConnHandler(conn net.Conn) {
 
 	for idx, each := range msp.Membership.Nodes {
 		if each.NodeID == id {
+			fmt.Println(each.Addrs)
             ip, _, err := net.SplitHostPort(conn.RemoteAddr().String())
             if err != nil {
                 log.Println("Failed to parse remote address:", err)
                 return
             }
-            msp.Membership.Nodes[idx].Addr = ip
+			fmt.Println(idx,ip)
+            // msp.Membership.Nodes[idx].Addrs = ip
             break
         }
 	}
@@ -162,9 +166,13 @@ func (s *server) GetMembership(ctx context.Context, msg *pb.MemberMsg) (*pb.Memb
 
 	msp.HandleMembershipRequest(msg)
 
+	log.Printf("GetMembership called nodes=%d", len(msg.Nodes))
+	defer log.Printf("GetMembership returning")
+
 	msp.RwM.RLock()
+	snap := proto.Clone(msp.Membership).(*pb.MemberMsg)
 	defer msp.RwM.RUnlock()
-	return msp.Membership, nil
+	return snap, nil
 }
 
 func main() {
