@@ -137,6 +137,7 @@ func JoinShard(channel string) {
 
 	topic, err := JoinNetwork(ctx, ps, "watchdog/"+channel, 2)
 	if err != nil {
+		fmt.Println("FAILED")
 		fmt.Println(err)
 		return
 	}

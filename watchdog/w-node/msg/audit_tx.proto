@@ -36,7 +36,7 @@ message auditMsg {
 
 message wnode {
   string nodeID = 1;
-  string addr = 2;
+  repeated string addrs = 2;  
   string port = 3;
   bytes publickey = 4;
   string seed = 5;
@@ -58,7 +58,7 @@ message committeeMsg {
 
 message committee {
     string nodeID = 1;
-    string addr = 2;
+    repeated string addrs = 2;  
     string port = 3;
     bytes publickey = 4;
 }
@@ -86,4 +86,5 @@ message gossipMsg {
     roundMsg rndMsg = 3;
     auditMsg rndblk = 4;
     string channel = 5;
+    int64 startConsensusTime =6;
 }

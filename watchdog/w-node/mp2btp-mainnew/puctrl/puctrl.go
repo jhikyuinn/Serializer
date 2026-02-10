@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"net"
 
 	"github.com/BurntSushi/toml"
 	"github.com/MCNL-HGU/mp2btp/puctrl/packet"
@@ -39,6 +40,45 @@ type PuCtrl struct {
 	state              int
 	chFinReceived      chan uint32 // Channel for receiving FIN packet
 	chFinAckReceived   chan uint32 // Channel for receiving FIN ACK packet
+
+
+	listenOnce   sync.Once
+	AuditBroadcaster *Broadcaster
+	AuditMsgChan     chan *packet.AuditDataPacket
+	AuditMsgAckChan  chan *packet.AuditDataAckPacket
+}
+
+type Broadcaster struct {
+	mu        sync.Mutex
+	listeners []chan *packet.AuditDataPacket
+}
+
+func NewBroadcaster() *Broadcaster {
+	return &Broadcaster{
+		listeners: make([]chan *packet.AuditDataPacket, 0),
+	}
+}
+
+// 리스너 등록 (각 소비자마다 사용)
+func (b *Broadcaster) Register() chan *packet.AuditDataPacket {
+	ch := make(chan *packet.AuditDataPacket, 10) // 버퍼 조정 가능
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.listeners = append(b.listeners, ch)
+	return ch
+}
+
+// 메시지 브로드캐스트
+func (b *Broadcaster) Broadcast(pkt *packet.AuditDataPacket) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.listeners {
+		select {
+		case ch <- pkt:
+		default:
+			fmt.Println("⚠️ 채널이 가득 찼습니다. 해당 리스너는 메시지를 받지 못했을 수 있음")
+		}
+	}
 }
 
 // Singleton instance
@@ -76,6 +116,9 @@ func CreatePuCtrl(configFile string, peerID uint32) *PuCtrl {
 		mutexSessionMap:     sync.Mutex{},
 		chFinReceived:       make(chan uint32, 1), // Channel for receiving FIN packet
 		chFinAckReceived:    make(chan uint32, 1), // Channel for receiving FIN packet
+		AuditMsgChan:        make(chan *packet.AuditDataPacket),
+		AuditMsgAckChan:     make(chan *packet.AuditDataAckPacket),
+		AuditBroadcaster:    NewBroadcaster(),
 	}
 
 	// Singletone instance
@@ -98,25 +141,20 @@ func GetPuCtrlInstance() *PuCtrl {
 
 // Listen() makes ready state to establish PuSession
 func (p *PuCtrl) Listen() {
-	if p.chStopListen != nil {
-		util.Log("PuCtrl.Listen(): Already listening")
-		return
-	}
-	p.chStopListen = make(chan bool)
+    p.listenOnce.Do(func() {
+        p.chStopListen = make(chan bool)
 
-	// Start fectun if enabled
-	if Conf.EQUIC_ENABLE {
-		// if Conf.PULL_MODE > 0 && Conf.PULL_MODE < 100 {
-		EnablePacketForwarding(0, false)
-		go RunEnhancedQuic(nil, false, PULL_SESSION, 0)
-		// } else {
-		// 	go RunEnhancedQuic(nil, true, PUSH_SESSION, 0)
-		// }
-	}
+        if Conf.EQUIC_ENABLE {
+            EnablePacketForwarding(0, false)
+            go RunEnhancedQuic(nil, false, PULL_SESSION, 0)
+        }
 
-	// Start listening
-	go Listener(p.chStopListen)
+        go Listener(p.chStopListen)
+        util.Log("PuCtrl.Listen(): Started listening")
+    })
 }
+
+var UDPConn    []*net.UDPConn
 
 // Connect() makes connection with nodes
 func (p *PuCtrl) Connect(nodeInfo []packet.NodeInfo, sessionType byte) {
@@ -134,7 +172,7 @@ func (p *PuCtrl) Connect(nodeInfo []packet.NodeInfo, sessionType byte) {
 	// Get child node's address
 	p.childAddr = make([]string, 0)
 	for i := myInfo.OffsetOfChild; i < myInfo.OffsetOfChild+myInfo.NumOfChilds; i++ {
-		nodeAddr := fmt.Sprintf("%s:%d", util.Int2ip(nodeInfo[i].IP), nodeInfo[i].Port)
+		nodeAddr := fmt.Sprintf("%s:%d", util.Int2ip(nodeInfo[i].IP), 5000)
 		p.childAddr = append(p.childAddr, nodeAddr)
 	}
 
@@ -142,7 +180,9 @@ func (p *PuCtrl) Connect(nodeInfo []packet.NodeInfo, sessionType byte) {
 		i := uint16(0)
 		for _, peerAddr := range p.childAddr {
 			// My address
-			myBindAddr := fmt.Sprintf("%s:%d", Conf.MY_IP_ADDRS[0], Conf.BIND_PORT+p.numSession)
+			sessionID := p.numSession
+			p.numSession++ 
+			myBindAddr := fmt.Sprintf("%s:%d", Conf.MY_IP_ADDRS[0], Conf.BIND_PORT+sessionID)
 
 			// Start fectun if enabled
 			if Conf.EQUIC_ENABLE {
@@ -155,24 +195,24 @@ func (p *PuCtrl) Connect(nodeInfo []packet.NodeInfo, sessionType byte) {
 
 				if sessionType == PUSH_SESSION && !isReceiver {
 					EnablePacketForwarding(p.numSession, false) // Enable packet forwarding
-					go RunEnhancedQuic([]string{util.GetIP(peerAddr)}, isReceiver, int(sessionType), p.numSession)
+					go RunEnhancedQuic([]string{util.GetIP(peerAddr)}, isReceiver, int(sessionType), sessionID)
 				}
 			}
 
 			util.Log("PuCtrl.Connect(): MyAddr=%s, PeerAddr=%s, SessionType=%d, numSession=%d",
-				myBindAddr, peerAddr, sessionType, p.numSession)
+				myBindAddr, peerAddr, sessionType, sessionID)
 
 			// Connect to peer
 			session := Connector(myBindAddr, peerAddr, sessionType)
 
 			util.Log("PuCtrl.Connect(): MyAddr=%s, PeerAddr=%s, SessionType=%d, SessionID=%d, numSession=%d",
-				myBindAddr, peerAddr, sessionType, session.sessionID, p.numSession)
+				myBindAddr, peerAddr, sessionType, session.sessionID, sessionID)
 
 			// Send Node Info
-			session.sendNodeInfoPacket(nodeInfo)
+			// session.sendNodeInfoPacket(nodeInfo)
 
 			// Send Path Info
-			session.sendPathInfoPacket(Conf.MY_IP_ADDRS[0:Conf.NUM_MULTIPATH])
+			// session.sendPathInfoPacket(Conf.MY_IP_ADDRS[0:Conf.NUM_MULTIPATH])
 
 			// Tricky method for test4
 			i++
@@ -213,6 +253,53 @@ func (p *PuCtrl) Send(blockFileName string, blockNumber uint32) {
 		panic("PuCtrl.SendBlock(): Push session does not exist!")
 	}
 }
+
+
+// KYUKYU
+func (p *PuCtrl) SendAuditMsg(data []byte) error {
+
+	isPushSessionExist := false
+	for sessionID := range p.sessionMap {
+		if p.sessionMap[sessionID].sessionType == PUSH_SESSION {
+			p.SendAuditInfo(sessionID, data)
+			isPushSessionExist = true
+		}
+	}
+
+	if !isPushSessionExist {
+		return fmt.Errorf("SendAuditMsg(): Push session does not exist")
+	}
+	return nil
+}
+
+//KYUKYU
+func (p *PuCtrl) SendAuditAckMsg(data []byte) error {
+
+	isPushSessionExist := false
+
+	for sessionID := range p.sessionMap {
+		if p.sessionMap[sessionID].sessionType == PUSH_SESSION {
+			p.SendAuditAckInfo(sessionID, data)
+			isPushSessionExist = true
+		}
+	}
+
+	if !isPushSessionExist {
+		return fmt.Errorf("SendAuditAckMsg(): Push session does not exist")
+	}
+	return nil
+}
+
+func (p *PuCtrl) ReceiveAuditMsg(sessionID uint32, pkt *packet.AuditDataPacket) {
+	fmt.Println("ReceiveAuditMsg")
+	p.AuditBroadcaster.Broadcast(pkt)
+}
+
+func (p *PuCtrl) ReceiveAuditMsgAck(sessionID uint32, pkt *packet.AuditDataAckPacket) {
+	fmt.Println("ReceiveAuditMsgAck")
+	p.AuditMsgAckChan <- pkt
+}
+
 
 // ReceiveBlock() function reads the requested block and stores it in the given byte slice.
 func (p *PuCtrl) Receive(buf []byte) (uint32, uint32, int, error) {
@@ -282,6 +369,45 @@ func (p *PuCtrl) GetNodeInfo(peerAddr []PeerAddr) []packet.NodeInfo {
 
 	return nodeInfo
 }
+
+func (pu *PuCtrl) CloseAllSessions() {
+	if pu ==nil{
+		return
+	}
+	for _, session := range pu.sessionMap {
+		session.Close() // session.handler 내부에서 graceful하게 처리되면 더 좋음
+	}
+
+	// for i, conn := range UDPConn {
+    //     if conn != nil {
+    //         fmt.Printf("CLOSE UDPConn[%d]: %v\n", i, conn.LocalAddr())
+    //         err := conn.Close()
+    //         if err != nil {
+    //             fmt.Println("❌ Failed to close UDPConn:", err)
+    //         } else {
+    //             fmt.Println("✅ UDPConn closed successfully")
+    //         }
+    //     }
+    // }
+
+    // // 전부 닫았으니 슬라이스 초기화
+    // UDPConn = nil
+
+    // 세션 맵 초기화
+    pu.sessionMap = make(map[uint32]*PuSession)
+}
+
+func (p *PuCtrl) DisconnectFromChildren() {
+	for sessionID, session := range p.sessionMap {
+		for _, child := range p.childAddr {
+			fmt.Printf("🔌 Disconnecting from child: %s\n", child)
+			session.Close() // stream, session 종료
+			delete(p.sessionMap, sessionID)
+			break
+		}
+	}
+}
+
 
 func (p *PuCtrl) SetNodeInfo(nodeinfos []packet.NodeInfo) {
 	nodeInfosLen := len(nodeinfos)

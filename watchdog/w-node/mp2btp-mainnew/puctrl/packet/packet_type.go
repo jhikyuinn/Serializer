@@ -13,6 +13,8 @@ const (
 	PATH_INFO_ACK_PACKET  = 20
 	FIN_PACKET            = 21
 	FIN_ACK_PACKET        = 22
-	PACKET_SIZE           = 1460 // maximum packet size (header + payload)
+	AUDIT_MSG_PACKET      = 23
+	AUDIT_MSG_ACK_PACKET  = 24
+	PACKET_SIZE           = 1460000000 // maximum packet size (header + payload)
 	PAYLOAD_SIZE          = 1024 // 1KB = SYMBOL SIZE, Block Data Size
 )

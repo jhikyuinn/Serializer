@@ -9,16 +9,16 @@ import (
 
 type ControlPacket struct {
 	Type   byte
-	Length uint16
+	Length uint32
 	Data   []byte
 }
 
-const CONTROL_PACKET_HEADER_LEN = 3
+const CONTROL_PACKET_HEADER_LEN = 5
 
 func CreateControlPacket(data []byte) *ControlPacket {
 	packet := ControlPacket{}
 	packet.Type = CONTROL_PACKET
-	packet.Length = uint16(CONTROL_PACKET_HEADER_LEN + len(data))
+	packet.Length = uint32(CONTROL_PACKET_HEADER_LEN + len(data))
 
 	if packet.Length > CONTROL_PACKET_HEADER_LEN+PAYLOAD_SIZE {
 		panic(fmt.Sprintf("packet length is larger than maximum size! (%d>%d)", packet.Length, CONTROL_PACKET_HEADER_LEN+PAYLOAD_SIZE))
@@ -36,7 +36,7 @@ func ParseControlPacket(r *bytes.Reader) (*ControlPacket, error) {
 		return nil, err
 	}
 
-	packetLegnth, err := util.ReadUint16(r)
+	packetLegnth, err := util.ReadUint32(r)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func ParseControlPacket(r *bytes.Reader) (*ControlPacket, error) {
 // Write Control Packet
 func (p *ControlPacket) Write(b *bytes.Buffer) error {
 	b.WriteByte(p.Type)
-	util.WriteUint16(b, uint16(p.Length))
+	util.WriteUint32(b, uint32(p.Length))
 	b.Write(p.Data)
 
 	return nil
